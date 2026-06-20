@@ -1,0 +1,26 @@
+# Example configuration for intraday trading system
+# Copy to config/local.yaml and customize
+
+# Data settings
+data:
+  symbol: "BTCUSDT"
+  venue: "binance"
+  data_dir: "data"
+
+# Logging
+logging:
+  level: "info"  # debug, info, warning, error
+  console: true
+  log_file: null  # or "logs/intraday.jsonl"
+
+# Download settings
+download:
+  batch_size: 1000
+  rate_limit_ms: 200  # Min ms between requests
+
+# Live capture settings
+capture:
+  flush_interval_s: 60
+  max_buffer_size: 10000
+  reconnect_delay_s: 5
+  max_reconnect_delay_s: 60

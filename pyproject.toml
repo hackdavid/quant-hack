@@ -1,0 +1,86 @@
+[project]
+name = "intraday"
+version = "0.1.0"
+description = "BTC/USD multi-agent intraday trading system"
+requires-python = ">=3.11"
+dependencies = [
+    # Core
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+
+    # CLI
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+
+    # Logging
+    "structlog>=23.0.0",
+
+    # Data
+    "polars>=0.20.0",
+    "pyarrow>=14.0.0",
+    "duckdb>=0.10.0",
+
+    # Network
+    "websockets>=12.0",
+    "aiohttp>=3.9.0",
+    "httpx>=0.26.0",
+
+    # Utils
+    "python-dateutil>=2.8.0",
+]
+
+[project.optional-dependencies]
+phase1 = [
+    "websockets>=12.0",
+    "aiohttp>=3.9.0",
+]
+phase2 = [
+    "numba>=0.59.0",
+    "scipy>=1.12.0",
+]
+phase4 = [
+    "torch>=2.1.0",
+    "peft>=0.8.0",
+    "transformers>=4.37.0",
+    "safetensors>=0.4.0",
+    "scikit-learn>=1.4.0",
+    "lightgbm>=4.3.0",
+]
+phase7 = [
+    "d3rlpy>=2.5.0",
+    "gymnasium>=0.29.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "hypothesis>=6.98.0",
+    "ruff>=0.2.0",
+]
+
+[project.scripts]
+intraday = "intraday.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "ANN", "B", "A", "COM", "C4", "DTZ", "ISC", "ICN", "G", "PIE", "T20", "PYI", "Q", "RSE", "RET", "SLF", "SIM", "ARG", "PTH", "ERA", "PD", "PL", "NPY", "RUF"]
+ignore = ["ANN101", "ANN102", "COM812", "ISC001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "network: marks tests that require network access",
+    "gpu: marks tests that require GPU",
+]
+asyncio_mode = "auto"
