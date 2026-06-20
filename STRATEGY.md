@@ -25,6 +25,8 @@
 - Phase 2: Feature engine (OFI, microprice, VPIN, etc.)
 - Phase 3: Queue-aware simulator
 - Phase 4: Forecast agent training pipeline
+  - ⭐ Uses **Kronos** (pre-trained foundation model) + custom TCN
+  - Transfer learning → 12 months is enough!
 - Phase 5: Other 4 agents (Orderflow, Regime, Risk, Stay-out)
 - Phase 6: Meta-learner aggregator
 - Phase 7: RL execution (CQL)
@@ -111,6 +113,7 @@
    - Train in 1-2 hours (vs 8-16 hours)
    - Test hyperparameters quickly
    - Experiment with architectures
+   - **Validate Kronos integration** (foundation model loading, LoRA setup)
 
 3. **Risk Reduction**
    - Prove entire pipeline works before committing to full training
@@ -165,6 +168,8 @@
 - Covers: Multiple market regimes, full volatility cycles
 - Good for: Production training, robust metrics
 - Required for: Trading with confidence
+- **Plus Kronos pre-training**: Effective ~10M+ samples (transfer learning)
+- **Result**: 12mo + Kronos > 5 years without foundation model
 
 ---
 

@@ -12,11 +12,16 @@
 
 This system combines cutting-edge quantitative techniques to build a complete intraday trading pipeline:
 
-- **L2 Microstructure Features**: Order flow imbalance (OFI), microprice, VPIN, Hawkes intensity
-- **Multi-Agent Architecture**: 5 specialized agents (Forecast, Orderflow, Regime, Risk, Stay-out) with meta-learning aggregation
-- **RL Execution**: Conservative Q-Learning (CQL) for slippage-aware execution optimization
-- **Probabilistic Forecasting**: Uncertainty-aware predictions with Brier score validation
-- **Continual Learning**: Monthly retraining pipeline to adapt to regime shifts
+- **🧠 Kronos Foundation Model**: Pre-trained time-series transformer (like GPT for numbers) - solves "not enough data" problem via transfer learning
+- **📊 L2 Microstructure Features**: Order flow imbalance (OFI), microprice, VPIN, Hawkes intensity
+- **🤖 Multi-Agent Architecture**: 5 specialized agents (Forecast, Orderflow, Regime, Risk, Stay-out) with meta-learning aggregation
+- **⚡ RL Execution**: Conservative Q-Learning (CQL) for slippage-aware execution optimization
+- **📈 Probabilistic Forecasting**: Uncertainty-aware predictions with Brier score validation
+- **🔄 Continual Learning**: Monthly retraining pipeline to adapt to regime shifts
+
+**Key Innovation:**
+- **Transfer Learning**: Uses Kronos (pre-trained on millions of time-series samples) → only 12 months BTC data needed
+- **Data Efficiency**: 12mo + Kronos > 5 years without foundation model
 
 **Target Performance:**
 - Sharpe Ratio: 1.5+ (sustained over 12+ months)
@@ -50,10 +55,12 @@ This system combines cutting-edge quantitative techniques to build a complete in
 │  5 ML Agents   │    │  RL Execution Agent  │
 │  (Phase 4-5)   │    │     (Phase 7)        │
 │                │    │                      │
-│ • Forecast     │    │  CQL for adaptive    │
-│ • Orderflow    │    │  entry/exit timing   │
-│ • Regime       │    │                      │
-│ • Risk         │    └──────────────────────┘
+│ • Forecast ⭐  │    │  CQL for adaptive    │
+│   (Kronos +    │    │  entry/exit timing   │
+│    TCN)        │    │                      │
+│ • Orderflow    │    └──────────────────────┘
+│ • Regime       │
+│ • Risk         │
 │ • Stay-out     │
 └───────┬────────┘
         │
@@ -190,7 +197,9 @@ quanthack/
 │   └── phases/             # Phase-by-phase implementation specs
 │       ├── 01_data.md
 │       ├── 02_features.md
+│       ├── 04_forecast.md  # ⭐ Kronos foundation model details
 │       └── ...
+├── ARCHITECTURE.md          # ⭐ Foundation model deep-dive
 ├── src/intraday/
 │   ├── data/               # Phase 1: Data collection
 │   │   ├── download.py     # Historical data downloader
@@ -359,11 +368,22 @@ pytest tests/ -m integration
 
 ## 🧠 ML Models & Techniques
 
-### Phase 4: Forecast Agent
-- **Architecture**: Transformer encoder (8 layers, 512 dim)
-- **Target**: 1-min, 5-min, 15-min forward returns
-- **Loss**: Quantile regression (uncertainty-aware)
+### Phase 4: Forecast Agent ⭐ **KEY INNOVATION**
+- **Foundation Model**: [Kronos](https://github.com/shiyu-coder/Kronos) (pre-trained time-series transformer)
+  - Pre-trained on millions of time-series samples (general temporal patterns)
+  - Fine-tuned via LoRA (5% params) on 12-month BTC data
+  - **Transfer learning** → data-efficient (like GPT for numbers!)
+- **Custom Branch**: Small TCN (4 layers, 64 channels) for crypto microstructure
+- **Fusion**: Concat Kronos (256-d) + TCN (64-d) → MLP forecast head
+- **Output**: Probability distribution over 11 bins (not point estimate)
+- **Target**: 5-min, 15-min, 60-min forward returns
+- **Loss**: Cross-entropy + focal loss (tail emphasis)
 - **Validation**: OOS Sharpe ≥0.5, Brier <0.5
+
+**Why This Works:**
+- Kronos brings pre-trained temporal understanding (trends, seasonality, regimes)
+- TCN learns crypto-specific signals (OFI, VPIN, toxic flow)
+- **12 months + Kronos > 5 years without foundation model**
 
 ### Phase 5: Other Agents
 - **Orderflow**: LSTM on L2 depth dynamics
@@ -386,8 +406,10 @@ pytest tests/ -m integration
 
 ## 📚 Key Resources
 
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - ⭐ Foundation model explanation (why 12 months is enough)
 - [Master Plan](idea/PLAN.md) - Overall strategy & data requirements
 - [Agent Design](idea/AGENTS.md) - Coding conventions & testing rules
+- [Phase 4 Spec](idea/phases/04_forecast.md) - Kronos + TCN implementation details
 - [CLI Spec](idea/CLI.md) - Complete command reference
 - [Phase Specs](idea/phases/) - Detailed implementation guides
 - [MASTER_INDEX.md](MASTER_INDEX.md) - Progress tracking (read this first!)
@@ -430,10 +452,12 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 Built as part of a quantitative trading research project. Key inspirations:
 
+- **Kronos**: [Time-series foundation model](https://github.com/shiyu-coder/Kronos) (Google Research)
 - L2 microstructure papers (Cont, Stoikov, Lehalle)
 - RL for execution (Spooner, Vyetrenko)
 - Multi-agent systems (Hendrycks, Sutton)
 - Continual learning (Kirkpatrick, Rolnick)
+- Meta-labeling (López de Prado)
 
 ---
 

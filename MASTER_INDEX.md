@@ -26,7 +26,7 @@ Build institutional-grade BTC/USD intraday trading system with:
 | 1 | Data Pipeline | 🔵 CURRENT | 12mo historical + 4-6wk live tick data | - | 2-3 days | **START HERE** |
 | 2 | Features (MVP) | ⚪ WAITING | Feature engine on 4-6wk dataset, IC >0.05 | - | 3-5 days | Use small dataset for dev |
 | 3 | Simulator (MVP) | ⚪ WAITING | Queue-aware backtest working on 4-6wk data | - | 4-6 days | Validate on small dataset |
-| 4 | Forecast (MVP) | ⚪ WAITING | Training pipeline working on GPU | 0.5-1 hr | 1-2 days | Test with 4-6wk data |
+| 4 | Forecast (MVP) | ⚪ WAITING | Kronos + TCN pipeline working on GPU | 0.5-1 hr | 1-2 days | Uses Kronos foundation model |
 | 5 | Other Agents (MVP) | ⚪ WAITING | All 4 agents training on GPU | 0.5-1 hr | 3-5 days | Fast iteration on small data |
 | 6 | Aggregator (MVP) | ⚪ WAITING | Meta-learner working on 4-6wk data | - | 2-4 days | End-to-end pipeline validated |
 | 7 | RL Execution (MVP) | ⚪ WAITING | CQL training on GPU (10k episodes) | 1-2 hrs | 3-5 days | Prove training works |
