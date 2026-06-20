@@ -23,16 +23,17 @@ Build institutional-grade BTC/USD intraday trading system with:
 | Phase | Name | Status | Acceptance | GPU Time | CPU Time | Notes |
 |-------|------|--------|------------|----------|----------|-------|
 | 0 | Setup | ✅ DONE | Planning complete | - | - | Phase specs in idea/ |
-| 1 | Data Pipeline | 🔵 CURRENT | Historical downloaded + WS live capture running for 4-6 weeks | - | 2-3 days | **START HERE** |
-| 2 | Features | ⚪ BLOCKED | Feature engine passing tests, IC >0.1 on key features | - | 3-5 days | Blocked: needs 4-6 weeks tick data from Phase 1 |
-| 3 | Simulator | ⚪ BLOCKED | Queue-aware backtest, slippage realistic vs historical | - | 4-6 days | Blocked: needs Phase 2 features |
-| 4 | Forecast | ⚪ BLOCKED | OOS Sharpe ≥0.5, Brier <0.5, inference <50ms | 2-4 hrs | 1-2 days | Blocked: needs Phase 3 simulator |
-| 5 | Other Agents | ⚪ BLOCKED | Each agent passing acceptance, IC >baseline | - | 3-5 days | Blocked: needs Phase 4 forecast |
-| 6 | Aggregator | ⚪ BLOCKED | OOS Sharpe ≥1.0 with meta-learner + Kelly | - | 2-4 days | Blocked: needs Phase 5 agents |
-| 7 | RL Execution | ⚪ BLOCKED | Slippage <0.8× AC baseline OR Sharpe +0.1 | 4-8 hrs | 3-5 days | Blocked: needs Phase 6 + 50k episodes |
-| 8 | Paper Trading | ⚪ BLOCKED | 1-3 months live simulation passing | - | 30-90 days | Blocked: needs Phase 7, RUNS IN PARALLEL |
-| 9 | Continual | ⚪ BLOCKED | Monthly update pipeline working, canary passing | - | 2-3 days | Blocked: needs Phase 8 data |
-| 10 | Live | ⚪ BLOCKED | Canary → tiny size → scale, kill-switch tested | - | Ongoing | Blocked: needs Phase 9 validation |
+| 1 | Data Pipeline | 🔵 CURRENT | 12mo historical + 4-6wk live tick data | - | 2-3 days | **START HERE** |
+| 2 | Features (MVP) | ⚪ WAITING | Feature engine on 4-6wk dataset, IC >0.05 | - | 3-5 days | Use small dataset for dev |
+| 3 | Simulator (MVP) | ⚪ WAITING | Queue-aware backtest working on 4-6wk data | - | 4-6 days | Validate on small dataset |
+| 4 | Forecast (MVP) | ⚪ WAITING | Training pipeline working on GPU | 0.5-1 hr | 1-2 days | Test with 4-6wk data |
+| 5 | Other Agents (MVP) | ⚪ WAITING | All 4 agents training on GPU | 0.5-1 hr | 3-5 days | Fast iteration on small data |
+| 6 | Aggregator (MVP) | ⚪ WAITING | Meta-learner working on 4-6wk data | - | 2-4 days | End-to-end pipeline validated |
+| 7 | RL Execution (MVP) | ⚪ WAITING | CQL training on GPU (10k episodes) | 1-2 hrs | 3-5 days | Prove training works |
+| **PROD** | **Retrain Full** | ⚪ WAITING | All models retrained on 12mo dataset | **6-12 hrs** | - | **Production models** |
+| 8 | Paper Trading | ⚪ WAITING | 1-3 months with production models | - | 30-90 days | Use full-data checkpoints |
+| 9 | Continual | ⚪ WAITING | Monthly update pipeline working | 2-4 hrs | 2-3 days | Retraining automation |
+| 10 | Live | ⚪ WAITING | Canary → scale, kill-switch tested | - | Ongoing | Production deployment |
 
 **Legend:**  
 ✅ DONE | 🔵 CURRENT | ⚪ BLOCKED | ❌ FAILED | 🟡 IN PROGRESS
@@ -46,9 +47,18 @@ Build institutional-grade BTC/USD intraday trading system with:
 **Spec:** `idea/phases/01_data.md`
 
 **Objective:** 
-1. Download 12-18 months historical BTC/USD data (klines, funding, OI)
+1. Download 12 months historical BTC/USD data (klines, funding, OI)
 2. Set up live WebSocket capture for tick + L2 depth data
-3. Let capture run for ≥4-6 weeks (blocking Phase 2)
+3. Collect ≥4-6 weeks tick data for MVP development
+
+**REVISED STRATEGY (2026-06-21):**
+- Use 4-6 weeks data as **development dataset** (fast iteration)
+- Build entire Phase 2-7 pipeline on small dataset first
+- Validate all code works end-to-end on GPU
+- **Then retrain on full 12-month dataset** for production models
+- Deploy production models to paper trading
+
+**Why:** Don't wait idle for 4-6 weeks. Use small dataset to de-risk development, then retrain for production.
 
 **Files to Create:**
 ```
@@ -90,9 +100,13 @@ uv run intraday data live-capture --venues binance --symbols BTCUSDT --kinds tra
 - [x] Implement live WS capture with reconnect logic
 - [x] Set up data/ directory structure
 - [x] Verify schema validation (16/16 tests passing)
+- [ ] **Deploy CPU machine** (8 CPU / 32GB RAM / 500GB disk)
 - [ ] Run historical download (12 months klines + funding + OI)
-- [ ] Start live capture service
-- [ ] ⏰ **SET CALENDAR REMINDER:** Check back in 4-6 weeks for Phase 2
+- [ ] Start live capture service (background for 4-6 weeks)
+- [ ] ⏰ **WAIT 4-6 weeks** while working on Phase 2-7 MVP
+- [ ] After 4-6 weeks: Start Phase 2-7 development on small dataset
+- [ ] After Phase 7 MVP complete: Retrain all models on 12-month data
+- [ ] Deploy production checkpoints to paper trading
 
 ---
 
@@ -121,20 +135,37 @@ Phase 7: batch_size = 256-512
 
 ---
 
-## 🎯 Next Steps (When Phase 1 Complete)
+## 🎯 Next Steps (Revised Strategy)
 
-**Immediate (After acceptance #1-5):**
-1. Update this file: Phase 1 status → ✅ DONE
-2. Phase 2 status → 🟡 WAITING (tick data collection)
-3. Set calendar reminder for 4-6 weeks
-4. Optional: Start reading Phase 2 spec to prepare
+**Week 1 (Current - Data Collection):**
+1. ✅ Provision CPU machine (8 CPU / 32GB RAM / 500GB)
+2. Download 12 months historical data (klines, funding, OI)
+3. Start live capture in tmux (runs for 4-6 weeks)
+4. Update Phase 1 status → ✅ DONE
 
-**After 4-6 Weeks (When tick data ready):**
-1. Verify ≥4-6 weeks of tick data captured
-2. Update Phase 2 status → 🔵 CURRENT
-3. Load `idea/phases/02_features.md`
-4. Implement feature engine
-5. Update this file when Phase 2 acceptance met
+**Weeks 2-6 (MVP Development on 4-6 Week Dataset):**
+1. Wait for 4-6 weeks tick data to accumulate
+2. Implement Phase 2-7 using small dataset:
+   - Phase 2: Feature engine (3-5 days)
+   - Phase 3: Simulator (4-6 days)
+   - Phase 4: Forecast agent MVP (1-2 days + 0.5-1 hr GPU)
+   - Phase 5: Other agents MVP (3-5 days + 0.5-1 hr GPU)
+   - Phase 6: Aggregator MVP (2-4 days)
+   - Phase 7: RL execution MVP (3-5 days + 1-2 hrs GPU)
+3. Validate entire pipeline works end-to-end
+4. Fix bugs, optimize code
+
+**Week 7 (Production Training):**
+1. Retrain all models on full 12-month dataset
+2. GPU training: 6-12 hours total (Phase 4 + 5 + 7 full-scale)
+3. Export production checkpoints
+4. Validate on holdout set (OOS metrics)
+
+**Week 8+ (Paper Trading):**
+1. Deploy production models to CPU machine
+2. Run paper trading for 1-3 months
+3. Monitor performance, optimize as needed
+4. Scale to live trading when ready
 
 ---
 
