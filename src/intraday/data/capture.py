@@ -35,8 +35,9 @@ class CaptureConfig(BaseModel):
 
     symbol: str = "BTCUSDT"
     venue: Literal["binance"] = "binance"
-    streams: list[Literal["trade", "depth", "mark_price", "liquidations"]] = [
-        "trade",
+    # aggTrade matches historical data.binance.vision aggTrades format exactly
+    streams: list[Literal["aggTrade", "depth", "mark_price", "liquidations"]] = [
+        "aggTrade",
         "depth",
         "mark_price",
     ]
@@ -48,8 +49,8 @@ class CaptureConfig(BaseModel):
     max_reconnect_delay_s: int = 60  # Max reconnect delay
 
 
-# Binance WebSocket base URLs
-BINANCE_WS_SPOT = "wss://stream.binance.com:9443/ws"
+# All streams use Binance FUTURES (perpetual contracts, fstream)
+# so live data matches historical data.binance.vision USDM futures format
 BINANCE_WS_FUTURES = "wss://fstream.binance.com/ws"
 
 
@@ -106,22 +107,29 @@ class StreamBuffer:
         self.last_flush = datetime.now(timezone.utc)
 
 
-async def parse_trade_message(msg: dict, symbol: str) -> Trade | None:
-    """Parse trade stream message.
+async def parse_agg_trade_message(msg: dict, symbol: str) -> Trade | None:
+    """Parse aggTrade stream message from Binance futures.
 
-    Format: https://binance-docs.github.io/apidocs/spot/en/#trade-streams
+    Field mapping matches data.binance.vision aggTrades CSV exactly:
+      a → agg_trade_id (stored as trade_id)
+      p → price
+      q → quantity
+      T → transact_time (time_ms)
+      m → is_buyer_maker
+
+    Format: https://binance-docs.github.io/apidocs/futures/en/#aggregate-trade-streams
     """
     try:
         return Trade(
             symbol=symbol,
-            trade_id=msg["t"],
+            trade_id=msg["a"],       # aggregate trade id
             price=float(msg["p"]),
             quantity=float(msg["q"]),
-            time_ms=msg["T"],
+            time_ms=msg["T"],        # trade execution time
             is_buyer_maker=msg["m"],
         )
     except (KeyError, ValueError) as e:
-        logger.error("parse.trade_error", error=str(e), msg=msg)
+        logger.error("parse.agg_trade_error", error=str(e), msg=msg)
         return None
 
 
@@ -289,15 +297,12 @@ async def subscribe_stream(
     symbol_lower = symbol.lower()
     reconnect_delay = config.reconnect_delay_s
 
-    # Determine WebSocket URL based on stream type
-    if stream_name in ["trade", "depth"]:
-        base_url = BINANCE_WS_SPOT
-    else:
-        base_url = BINANCE_WS_FUTURES
+    # All streams use Binance FUTURES endpoint
+    base_url = BINANCE_WS_FUTURES
 
     # Construct stream URL
-    if stream_name == "trade":
-        url = f"{base_url}/{symbol_lower}@trade"
+    if stream_name == "aggTrade":
+        url = f"{base_url}/{symbol_lower}@aggTrade"
     elif stream_name == "depth":
         url = f"{base_url}/{symbol_lower}@depth20@100ms"
     elif stream_name == "mark_price":
@@ -319,8 +324,8 @@ async def subscribe_stream(
                     data = json.loads(message)
 
                     # Parse based on stream type
-                    if stream_name == "trade":
-                        trade = await parse_trade_message(data, symbol)
+                    if stream_name == "aggTrade":
+                        trade = await parse_agg_trade_message(data, symbol)
                         if trade:
                             buffer.add_trade(trade)
                     elif stream_name == "depth":

@@ -1,471 +1,367 @@
-# BTC/USD Intraday Trading System
+# BTC/USDT Intraday Trading System
 
-> Institutional-grade multi-agent trading system targeting **Sharpe 1.5+** on BTC/USD perpetual futures using L2 microstructure signals, probabilistic forecasting, and RL-optimized execution.
-
-[![Tests](https://img.shields.io/badge/tests-16%2F16%20passing-success)](tests/)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+Probabilistic, regime-aware, multi-agent intraday trading system for BTC/USDT perpetual futures (Binance USDM).
+**Target: OOS Sharpe ≥ 1.0 in paper trading before touching live money.**
 
 ---
 
-## 🎯 Project Overview
+## Current Status
 
-This system combines cutting-edge quantitative techniques to build a complete intraday trading pipeline:
+| Phase | What | Status |
+|-------|------|--------|
+| 0 | Setup — repo, deps, CLI skeleton | ✅ Done |
+| 1 | Data — bulk download + live WebSocket capture | ✅ Done (31 days) |
+| 2 | Features — 25 features, LazyFeatureStore | ✅ Done (8,928 rows) |
+| 3 | Simulator — queue-aware, canary 0.000 bps error | ✅ Done |
+| 4 | Forecast — Kronos+TCN+meta-label, smoke-tested | ✅ Code done, needs training |
+| 5 | Agents — OrderflowAgent/RiskAgent/StayOut work; RegimeAgent needs fit | ✅ Code done, needs training |
+| 6 | Aggregator — MetaLearner + Kelly + CVaR | ✅ Code done, needs Phase 4+5 first |
+| 7 | RL Execution — ExecutionEnv + CQL | ✅ Code done, needs Phase 6 first |
+| 8 | Paper Trading | ❌ Not built |
 
-- **🧠 Kronos Foundation Model**: Pre-trained time-series transformer (like GPT for numbers) - solves "not enough data" problem via transfer learning
-- **📊 L2 Microstructure Features**: Order flow imbalance (OFI), microprice, VPIN, Hawkes intensity
-- **🤖 Multi-Agent Architecture**: 5 specialized agents (Forecast, Orderflow, Regime, Risk, Stay-out) with meta-learning aggregation
-- **⚡ RL Execution**: Conservative Q-Learning (CQL) for slippage-aware execution optimization
-- **📈 Probabilistic Forecasting**: Uncertainty-aware predictions with Brier score validation
-- **🔄 Continual Learning**: Monthly retraining pipeline to adapt to regime shifts
-
-**Key Innovation:**
-- **Transfer Learning**: Uses Kronos (pre-trained on millions of time-series samples) → only 12 months BTC data needed
-- **Data Efficiency**: 12mo + Kronos > 5 years without foundation model
-
-**Target Performance:**
-- Sharpe Ratio: 1.5+ (sustained over 12+ months)
-- Max Drawdown: <15%
-- Win Rate: 52-58%
-- Avg Trade Duration: 15-120 minutes
+**Blocker:** Only 31 days of raw data. Training needs 12 months. The data download below fixes this.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Data Pipeline (Phase 1)                  │
-│  Historical (12mo) + Live WebSocket (trades, L2 depth, funding) │
-└────────────────────┬────────────────────────────────────────────┘
-                     │
-┌────────────────────▼────────────────────────────────────────────┐
-│                   Feature Engine (Phase 2)                      │
-│   OFI, Microprice, VPIN, Hawkes, RSI, Funding, Volatility      │
-└────────────────────┬────────────────────────────────────────────┘
-                     │
-┌────────────────────▼────────────────────────────────────────────┐
-│                Queue-Aware Simulator (Phase 3)                  │
-│      Realistic fills, L2 matching, latency, slippage           │
-└────────────────────┬────────────────────────────────────────────┘
-                     │
-        ┌────────────┴────────────┐
-        │                         │
-┌───────▼────────┐    ┌───────────▼──────────┐
-│  5 ML Agents   │    │  RL Execution Agent  │
-│  (Phase 4-5)   │    │     (Phase 7)        │
-│                │    │                      │
-│ • Forecast ⭐  │    │  CQL for adaptive    │
-│   (Kronos +    │    │  entry/exit timing   │
-│    TCN)        │    │                      │
-│ • Orderflow    │    └──────────────────────┘
-│ • Regime       │
-│ • Risk         │
-│ • Stay-out     │
-└───────┬────────┘
+Feature Store (25 features, 5-min bars)
         │
-┌───────▼──────────────────────┐
-│  Meta-Learner Aggregator     │
-│       (Phase 6)              │
-│  Kelly-weighted ensemble     │
-└───────┬──────────────────────┘
-        │
-┌───────▼──────────────────────┐
-│   Paper Trading (Phase 8)    │
-│     1-3 months validation    │
-└───────┬──────────────────────┘
-        │
-┌───────▼──────────────────────┐
-│  Continual Learning (Phase 9)│
-│   Monthly retraining loop    │
-└───────┬──────────────────────┘
-        │
-┌───────▼──────────────────────┐
-│     Live Trading (Phase 10)  │
-│  Canary → Scale with safety  │
-└──────────────────────────────┘
+   ┌────┴────────────────────────────┐
+   │                                  │
+ForecastAgent (Phase 4)               │
+  Kronos-base [frozen, 102M params]   │
+  + SmallTCN [trained, 500K params]   │
+  → probabilistic 11-bin output       │
+                                      │
+OrderflowAgent ──┐                    │
+RegimeAgent ─────┤→ Aggregator ───────┤→ DecisionEngine → SizingEngine (Kelly)
+RiskAgent ───────┤   (Phase 6)        │         │
+StayOutDetector ─┘   LightGBM         │         ↓
+                                      │   RL Execution (Phase 7)
+                                      │   CQL (fills only, not direction)
+                                      │         │
+                                      └─────────┴─→ Simulator / Live exchange
 ```
+
+**Hard acceptance gates (do not skip):**
+- Phase 4: OOS Brier < baseline AND OOS Sharpe ≥ 0.5
+- Phase 6: OOS Sharpe ≥ 1.0 — THE make-or-break gate
+- Phase 7: Slippage(RL) < 0.8 × Almgren-Chriss OR Sharpe(v6) ≥ Sharpe(v5) + 0.1
 
 ---
 
-## 🚀 Quick Start
-
-### Prerequisites
-
-- Python 3.11+
-- [uv](https://github.com/astral-sh/uv) (recommended) or pip
-- 500GB disk space (for data storage)
-- GPU (optional, for Phase 4 & 7 training acceleration)
-
-### Installation
+## Prerequisites
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/quanthack.git
-cd quanthack
+# Python 3.11+, uv package manager
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install dependencies (using uv)
+# Clone this repo
+git clone <repo-url>
+cd quant-hack
+
+# Install dependencies
 uv sync
 
-# Or with pip
-pip install -e .
+# Clone Kronos source (required — loader imports from here)
+git clone https://github.com/shiyu-coder/Kronos.git Kronos
 ```
 
-### Phase 1: Data Collection
+---
+
+## Step-by-Step Pipeline
+
+### Step 1 — Download 12 months of historical data
+
+Downloads all 5 data kinds (aggTrades, klines_1m, klines_5m, bookDepth, metrics)
+from `data.binance.vision` (S3 archive — not geo-blocked).
+Takes ~20-40 min. Safe to re-run (skips existing files).
 
 ```bash
-# 1. Download 12 months historical data (~20-30 minutes)
-uv run intraday data download --kind klines_5m --start 2024-01-01 --end 2024-12-31
-uv run intraday data download --kind klines_1m --start 2024-01-01 --end 2024-12-31
-uv run intraday data download --kind funding --start 2024-01-01 --end 2024-12-31
-uv run intraday data download --kind open_interest --start 2024-01-01 --end 2024-12-31
+uv run intraday data download-bulk \
+  --start 2025-06-01 \
+  --end   2026-05-31
+```
 
-# 2. Start live data capture (runs in background)
-tmux new -s data-capture
-uv run intraday data live-capture --streams trade,depth,mark_price
+Check what was downloaded:
 
-# Detach: Ctrl+B, D
-# Reattach later: tmux attach -t data-capture
-
-# 3. Check data collection status
+```bash
 uv run intraday data summary
-uv run intraday data checkpoint
 ```
 
-**Note:** Collect at least 4-6 weeks of live tick data before proceeding to Phase 2-7 development.
+---
 
-### Development Workflow
+### Step 2 — Compute features
+
+Processes one day at a time. Carries rolling state (VPIN, Hawkes) across day boundaries.
+Output: `data/features/BTCUSDT/YYYY-MM-DD.parquet` — 288 rows/day, 25 features per row.
 
 ```bash
-# Run tests
-pytest tests/ -v
+uv run intraday features compute \
+  --start 2025-06-01 \
+  --end   2026-05-31
+```
 
-# Run specific phase tests
-pytest tests/phase_01/ -v  # Data pipeline
-pytest tests/phase_02/ -v  # Feature engine (when ready)
+Verify feature store:
 
-# Check code quality
-ruff check src/
-mypy src/
+```bash
+uv run intraday features summary
+```
+
+Expected: ~365 files, ~105,000 rows, 25 features, nulls only in VPIN warmup.
+
+---
+
+### Step 3 — Download Kronos model weights
+
+Only needed once. Already done if `models/kronos-base/` and `models/kronos-tokenizer/` exist.
+
+```bash
+uv run python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('NeoQuasar/Kronos-base',          local_dir='models/kronos-base')
+snapshot_download('NeoQuasar/Kronos-Tokenizer-base', local_dir='models/kronos-tokenizer')
+"
+```
+
+Model sizes: Kronos-base 102M params (390 MB), tokenizer 4M params (15 MB).
+
+---
+
+### Step 4 — Smoke-test Phase 4 pipeline
+
+Runs 1 batch through the full Kronos → TCN → head → loss → backward path.
+Completes in ~5 seconds. Confirms everything is wired correctly before committing to training.
+
+```bash
+uv run intraday forecast train --smoke-test
+```
+
+Expected output: `[SMOKE TEST DONE] train_loss=X.XXXX  Pipeline verified — all components functional.`
+
+---
+
+### Step 5 — Train Phase 4 forecast model
+
+Uses the first 9 months for training, months 10-11 for validation, month 12 held out for OOS.
+
+```bash
+uv run intraday forecast train \
+  --train-end  2026-03-31 \
+  --val-start  2026-04-01 \
+  --val-end    2026-05-31 \
+  --epochs     5 \
+  --batch-size 4 \
+  --device     auto
+```
+
+**Time estimates:**
+
+| Hardware | Time/epoch | 5 epochs |
+|----------|-----------|----------|
+| CPU (this machine) | ~16 min | **~80 min** |
+| A100 GPU | ~1.5 min | ~8 min |
+| RTX 4090 | ~2 min | ~12 min |
+
+**Resume after interruption** (checkpoints saved after every epoch):
+
+```bash
+uv run intraday forecast train \
+  --train-end    2026-03-31 \
+  --val-start    2026-04-01 \
+  --val-end      2026-05-31 \
+  --epochs       5 \
+  --batch-size   4 \
+  --resume-from  models/forecast/<run-timestamp>/checkpoint_epoch02.pt
+```
+
+**Gate:** Do not proceed to Step 7 unless OOS Brier < random baseline AND OOS Sharpe ≥ 0.5.
+
+---
+
+### Step 5b — (GPU machine) Transfer data and train
+
+If training on a separate GPU machine:
+
+```bash
+# On this machine — copy features to GPU host
+rsync -avz data/features/         gpu-host:quant-hack/data/features/
+rsync -avz data/raw/binance/klines_1m/  gpu-host:quant-hack/data/raw/binance/klines_1m/
+rsync -avz models/kronos-base/    gpu-host:quant-hack/models/kronos-base/
+rsync -avz models/kronos-tokenizer/ gpu-host:quant-hack/models/kronos-tokenizer/
+rsync -avz Kronos/                gpu-host:quant-hack/Kronos/
+
+# On the GPU machine
+uv add torch --index https://download.pytorch.org/whl/cu124   # match your CUDA version
+
+uv run intraday forecast train \
+  --train-end  2026-03-31 \
+  --val-start  2026-04-01 \
+  --val-end    2026-05-31 \
+  --epochs     5 \
+  --batch-size 32 \
+  --device     cuda
 ```
 
 ---
 
-## 📊 Development Strategy
+### Step 6 — Train RegimeAgent (Phase 5)
 
-**Revised Plan (Optimized for Speed):**
+Fits HMM(6 states) + LightGBM on 10 months of feature data.
 
-1. **Phase 1 (Days 1-3)**: Collect 4-6 weeks live data + 12 months historical
-2. **Phase 2-7 (Days 4-25)**: Build entire pipeline using 4-6 week dataset as MVP
-   - Fast iteration on small dataset
-   - Validate all code on GPU (training in hours, not days)
-   - Ensure end-to-end pipeline works
-3. **Retrain on Full Data (Days 26-28)**: Train production models on 12-month dataset
-4. **Phase 8 (Days 29-30+)**: Paper trade with production models, optimize
+```bash
+uv run intraday agent train regime \
+  --start 2025-06-01 \
+  --end   2026-03-31
+```
 
-**Key Insight:** Don't wait 4-6 weeks idle. Use small dataset to de-risk all development, then retrain for production.
+Note: `OrderflowAgent`, `RiskAgent`, and `StayOutDetector` are rule-based — no training needed.
 
 ---
 
-## 🎯 Phase Breakdown
+### Step 7 — Train aggregator (Phase 6)
 
-| Phase | Name | Duration | GPU Time | Output |
-|-------|------|----------|----------|--------|
-| 1 | Data Pipeline | 2-3 days + 4-6 weeks collection | - | Historical + live tick data |
-| 2 | Feature Engine | 3-5 days | - | OFI, VPIN, Hawkes, etc. |
-| 3 | Simulator | 4-6 days | - | Queue-aware backtester |
-| 4 | Forecast Agent | 1-2 days | 2-4 hrs | Probabilistic price forecasts |
-| 5 | Other Agents | 3-5 days | - | Orderflow, Regime, Risk, Stay-out |
-| 6 | Aggregator | 2-4 days | - | Meta-learner ensemble |
-| 7 | RL Execution | 3-5 days | 4-8 hrs | CQL execution policy |
-| 8 | Paper Trading | 30-90 days | - | Live validation |
-| 9 | Continual Learning | 2-3 days | - | Monthly update pipeline |
-| 10 | Live Trading | Ongoing | - | Production deployment |
+Trains the LightGBM meta-learner that combines all agent outputs into a final trading decision.
+Requires Phase 4 and Phase 5 to be trained first.
 
-**Total:** 60-80 days (MVP → Production)
+```bash
+uv run intraday train train \
+  --start   2025-06-01 \
+  --end     2026-03-31
+```
+
+**Hard gate:** OOS Sharpe ≥ 1.0 with full realistic costs (spread + fees + funding).
+If this gate fails, debug label/feature leakage before Phase 7 — do not proceed.
 
 ---
 
-## 📁 Project Structure
+### Step 8 — Backtest v5 (full pipeline, no RL)
+
+Runs the complete multi-agent pipeline over the held-out month with realistic costs.
+
+```bash
+uv run intraday backtest run \
+  --strategy v5_full_no_rl \
+  --start    2026-04-01 \
+  --end      2026-05-31 \
+  --capital  10000 \
+  --report
+```
+
+Compare strategies side-by-side:
+
+```bash
+uv run intraday backtest compare <run-id-1> <run-id-2>
+```
+
+---
+
+### Step 9 — Train RL execution (Phase 7)
+
+Only do this if Step 8 shows Sharpe ≥ 1.0. RL on a zero-alpha pipeline amplifies noise.
+
+```bash
+# Collect offline dataset (~50k episodes)
+uv run intraday rl collect-data \
+  --start  2026-05-20 \
+  --end    2026-06-19
+
+# Train CQL policy (200k steps)
+uv run intraday rl train
+
+# Evaluate vs Almgren-Chriss baseline
+uv run intraday rl evaluate
+```
+
+**Gate:** Realized slippage < 80% of Almgren-Chriss baseline. If not met, ship v5 to paper trading without RL.
+
+---
+
+### Step 10 — Backtest v6 (full pipeline + RL)
+
+```bash
+uv run intraday backtest run \
+  --strategy v6_full_with_rl \
+  --start    2026-04-01 \
+  --end      2026-05-31 \
+  --report
+```
+
+---
+
+## Live Data Capture
+
+For paper trading you need live WebSocket data. Run this continuously in a tmux session:
+
+```bash
+tmux new -s data-capture
+uv run intraday data live-capture
+# Detach: Ctrl+B then D
+# Reattach: tmux attach -t data-capture
+```
+
+---
+
+## Project Layout
 
 ```
-quanthack/
-├── idea/                    # Planning & design docs
-│   ├── PLAN.md             # Master strategy document
-│   ├── AGENTS.md           # Agent design & coding rules
-│   ├── CLI.md              # Complete CLI specification
-│   └── phases/             # Phase-by-phase implementation specs
-│       ├── 01_data.md
-│       ├── 02_features.md
-│       ├── 04_forecast.md  # ⭐ Kronos foundation model details
-│       └── ...
-├── ARCHITECTURE.md          # ⭐ Foundation model deep-dive
+quant-hack/
 ├── src/intraday/
-│   ├── data/               # Phase 1: Data collection
-│   │   ├── download.py     # Historical data downloader
-│   │   ├── capture.py      # Live WebSocket capture
-│   │   ├── schema.py       # Parquet schema validation
-│   │   └── cli.py          # CLI commands
-│   ├── features/           # Phase 2: Feature engine (coming soon)
-│   ├── sim/                # Phase 3: Simulator (coming soon)
-│   ├── agents/             # Phase 4-5: ML agents (coming soon)
-│   ├── aggregator/         # Phase 6: Meta-learner (coming soon)
-│   ├── execution/          # Phase 7: RL execution (coming soon)
-│   └── continual/          # Phase 9: Retraining loop (coming soon)
-├── tests/
-│   ├── phase_01/           # Data pipeline tests (16 passing)
-│   └── ...
-├── data/                   # Data storage (gitignored)
-│   ├── raw/binance/        # Historical + live data
-│   ├── processed/          # Feature-engineered data
-│   └── checkpoints/        # Download progress tracking
-├── config/
-│   ├── features.yaml       # Feature engine config
-│   ├── models.yaml         # Model hyperparameters
-│   └── risk.yaml           # Risk management rules
-├── MASTER_INDEX.md         # Project progress tracker
-├── SESSION_START.md        # Quick orientation guide
-└── QUICKSTART.md           # Phase 1 usage guide
+│   ├── data/              # Phase 1 — download, live capture
+│   ├── features/          # Phase 2 — 25-feature calculator
+│   ├── sim/               # Phase 3 — queue-aware simulator
+│   │   └── strategies/    # v0_buy_hold, v1_random, v5_full_no_rl, v6_full_with_rl
+│   ├── forecast/          # Phase 4 — Kronos + TCN + meta-label
+│   ├── agents/            # Phase 5 — orderflow, regime, risk, stay_out
+│   ├── aggregator/        # Phase 6 — MetaLearner + Kelly sizing
+│   └── rl/                # Phase 7 — ExecutionEnv + CQL policy
+├── Kronos/                # Cloned Kronos source (github.com/shiyu-coder/Kronos)
+├── models/
+│   ├── kronos-base/       # Kronos-base weights (NeoQuasar/Kronos-base)
+│   ├── kronos-tokenizer/  # Tokenizer weights (NeoQuasar/Kronos-Tokenizer-base)
+│   └── forecast/          # Trained TCN + head checkpoints (written by train)
+├── data/
+│   ├── raw/binance/       # aggTrades, klines_1m, klines_5m, bookDepth, metrics
+│   └── features/BTCUSDT/  # Computed feature parquets (288 rows/day)
+├── runs/                  # Backtest outputs (metrics.json, report.html)
+├── idea/phases/           # Phase specs 00-10 — the contract
+└── AGENTS.md              # Code style rules — non-negotiable
 ```
 
 ---
 
-## 🛠️ CLI Reference
+## Key Design Rules
 
-### Data Commands
-
-```bash
-# Download historical data
-intraday data download \
-  --kind klines_5m \
-  --start 2024-01-01 \
-  --end 2024-12-31
-
-# Start live capture
-intraday data live-capture \
-  --streams trade,depth,mark_price,liquidations
-
-# Check status
-intraday data summary
-intraday data checkpoint
-```
-
-### Training Commands (Phase 4-7)
-
-```bash
-# Train forecast agent (Phase 4)
-intraday train forecast \
-  --data-start 2024-01-01 \
-  --data-end 2024-12-31 \
-  --model transformer \
-  --device cuda
-
-# Train RL execution (Phase 7)
-intraday train execution \
-  --episodes 50000 \
-  --device cuda \
-  --checkpoint-dir models/execution/
-
-# Backtest strategy (Phase 3+)
-intraday backtest \
-  --start 2024-06-01 \
-  --end 2024-12-31 \
-  --agents forecast,orderflow,regime \
-  --execution rl
-```
-
-### Paper Trading (Phase 8)
-
-```bash
-# Start paper trading
-intraday trade paper \
-  --symbol BTCUSDT \
-  --strategy ensemble \
-  --risk-limit 0.01
-
-# Monitor performance
-intraday trade monitor --mode paper
-
-# Generate report
-intraday trade report \
-  --start 2024-06-01 \
-  --end 2024-06-30 \
-  --output reports/june_performance.html
-```
+- **Polars not pandas** — all feature/data code uses Polars
+- **Walk-forward splits only** — purged k-fold + embargo, never random split
+- **UTC always** — all timestamps in milliseconds UTC
+- **No LSTM** — TCN only for sequence modelling
+- **RL for execution only** — CQL fills HOW we execute, never WHAT direction
+- **Structlog not print()** — all logging via structlog
+- **No live $ until canary passes ≥ 4 weeks paper trading**
 
 ---
 
-## 🧪 Testing
+## Forecast Model Details (Phase 4)
 
-```bash
-# Run all tests
-pytest tests/ -v
-
-# Run specific phase
-pytest tests/phase_01/ -v
-
-# Run with coverage
-pytest tests/ --cov=src/intraday --cov-report=html
-
-# Run integration tests only
-pytest tests/ -m integration
-```
-
-**Current Status:** 16/16 Phase 1 tests passing ✅
+| Component | Details |
+|-----------|---------|
+| Kronos backbone | NeoQuasar/Kronos-base, 102M params, d_model=832, 12 layers, frozen |
+| Tokenizer | NeoQuasar/Kronos-Tokenizer-base, converts OHLCV+amount → discrete tokens |
+| SmallTCN | 4 dilated causal conv layers, 64 channels, trained from scratch |
+| ForecastHead | MLP: (832+64) → 256 → 128 → 11 logits |
+| Labels | Triple-barrier (López de Prado ch.3), pt=1.5σ, sl=1.0σ, horizon=15min |
+| Splits | Purged k-fold (López de Prado ch.7), embargo=1% |
+| Trainable params | ~500K (only TCN + head; Kronos frozen) |
+| Input to Kronos | 256-bar 1m OHLCV window, per-window z-normalized + clipped |
+| Input to TCN | 128-bar 5m feature window (25 features) |
+| Output | 11-bin probability distribution over σ-normalised forward returns |
 
 ---
 
-## 📈 Performance Targets
+## Disclaimer
 
-### Backtest Metrics (Phase 3-7)
-
-- **Sharpe Ratio (OOS)**: ≥1.0 (Phase 6), ≥1.5 (Phase 7 with RL)
-- **Max Drawdown**: <15%
-- **Win Rate**: 52-58%
-- **Avg Trade Duration**: 15-120 minutes
-- **Feature IC**: >0.1 (key features like OFI, microprice)
-- **Brier Score**: <0.5 (probabilistic forecasts)
-
-### Paper Trading Acceptance (Phase 8)
-
-- Sharpe ≥1.0 sustained for ≥4 weeks
-- No single-day loss >3%
-- Execution slippage <5 bps on average
-- Uptime >99.5%
-
-### Live Trading Safety (Phase 10)
-
-- Start with canary (0.1% of target size)
-- Scale only after 2 weeks stable performance
-- Kill-switch on:
-  - Drawdown >5% in 24 hours
-  - Sharpe <0.5 over 2 weeks
-  - API latency >100ms (p99)
-
----
-
-## 🔒 Risk Management
-
-**Hard Limits:**
-- Max position size: 1% of portfolio per trade
-- Max daily loss: 3% of portfolio
-- Max drawdown trigger: 15% (pause trading)
-- Max leverage: 5x (crypto futures)
-
-**Pre-Trade Checks:**
-- Regime agent approval (no high-risk regimes)
-- Stay-out agent approval (avoid crowded/toxic flows)
-- Risk agent position sizing
-- Minimum liquidity requirement (depth >10x position size)
-
-**Real-Time Monitoring:**
-- PnL tracking every second
-- Latency monitoring (kill if >100ms p99)
-- API health checks (reconnect logic)
-- Model drift detection (trigger retraining)
-
----
-
-## 🧠 ML Models & Techniques
-
-### Phase 4: Forecast Agent ⭐ **KEY INNOVATION**
-- **Foundation Model**: [Kronos](https://github.com/shiyu-coder/Kronos) (pre-trained time-series transformer)
-  - Pre-trained on millions of time-series samples (general temporal patterns)
-  - Fine-tuned via LoRA (5% params) on 12-month BTC data
-  - **Transfer learning** → data-efficient (like GPT for numbers!)
-- **Custom Branch**: Small TCN (4 layers, 64 channels) for crypto microstructure
-- **Fusion**: Concat Kronos (256-d) + TCN (64-d) → MLP forecast head
-- **Output**: Probability distribution over 11 bins (not point estimate)
-- **Target**: 5-min, 15-min, 60-min forward returns
-- **Loss**: Cross-entropy + focal loss (tail emphasis)
-- **Validation**: OOS Sharpe ≥0.5, Brier <0.5
-
-**Why This Works:**
-- Kronos brings pre-trained temporal understanding (trends, seasonality, regimes)
-- TCN learns crypto-specific signals (OFI, VPIN, toxic flow)
-- **12 months + Kronos > 5 years without foundation model**
-
-### Phase 5: Other Agents
-- **Orderflow**: LSTM on L2 depth dynamics
-- **Regime**: HMM + volatility clustering
-- **Risk**: Gradient boosting (XGBoost)
-- **Stay-out**: Binary classifier (toxic flow detection)
-
-### Phase 6: Meta-Learner
-- **Aggregation**: Online ridge regression
-- **Weighting**: Kelly criterion for agent allocation
-- **Updates**: Rolling 7-day window
-
-### Phase 7: RL Execution
-- **Algorithm**: Conservative Q-Learning (CQL)
-- **State**: Queue position, spread, inventory, urgency
-- **Action**: Passive (limit), aggressive (market), cancel
-- **Reward**: PnL - λ × slippage
-
----
-
-## 📚 Key Resources
-
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** - ⭐ Foundation model explanation (why 12 months is enough)
-- [Master Plan](idea/PLAN.md) - Overall strategy & data requirements
-- [Agent Design](idea/AGENTS.md) - Coding conventions & testing rules
-- [Phase 4 Spec](idea/phases/04_forecast.md) - Kronos + TCN implementation details
-- [CLI Spec](idea/CLI.md) - Complete command reference
-- [Phase Specs](idea/phases/) - Detailed implementation guides
-- [MASTER_INDEX.md](MASTER_INDEX.md) - Progress tracking (read this first!)
-
----
-
-## 🤝 Contributing
-
-This is a personal research project, but feedback is welcome!
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
----
-
-## ⚠️ Disclaimer
-
-**This is research/educational software for algorithmic trading development.**
-
-- No guarantees of profitability
-- Cryptocurrency trading carries significant risk
-- Past performance does not guarantee future results
-- Use at your own risk
-- Not financial advice
-
-**Never risk more than you can afford to lose.**
-
----
-
-## 🎓 Acknowledgments
-
-Built as part of a quantitative trading research project. Key inspirations:
-
-- **Kronos**: [Time-series foundation model](https://github.com/shiyu-coder/Kronos) (Google Research)
-- L2 microstructure papers (Cont, Stoikov, Lehalle)
-- RL for execution (Spooner, Vyetrenko)
-- Multi-agent systems (Hendrycks, Sutton)
-- Continual learning (Kirkpatrick, Rolnick)
-- Meta-labeling (López de Prado)
-
----
-
-## 📊 Current Status
-
-**Phase:** 1 (Data Pipeline)  
-**Progress:** Implementation complete (16/16 tests passing)  
-**Next Milestone:** Collect 4-6 weeks live data, then build Phase 2-7 pipeline  
-**Last Updated:** 2026-06-21
-
-For detailed progress, see [MASTER_INDEX.md](MASTER_INDEX.md)
+Research/educational software. Cryptocurrency trading carries significant risk of loss.
+Not financial advice. Never risk more than you can afford to lose.

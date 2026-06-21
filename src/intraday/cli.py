@@ -1,7 +1,7 @@
 """CLI entry point for intraday trading system."""
 
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -13,102 +13,118 @@ from rich.table import Table
 from intraday.data import (
     CaptureConfig,
     Checkpoint,
-    DownloadConfig,
-    capture_live,
-    download_historical,
     get_checkpoint_path,
+    capture_live,
 )
+from intraday.agents.cli import agents_app
+from intraday.aggregator.cli import aggregator_app
+from intraday.data.binance_bulk import BulkKind, download_bulk
+from intraday.forecast.cli import forecast_app
+from intraday.rl.cli import rl_app
+from intraday.sim.cli import backtest_app
 from intraday.utils.logging import setup_logging
 
 app = typer.Typer(name="intraday", help="BTC/USD multi-agent intraday trading system")
 data_app = typer.Typer(help="Data acquisition and management")
+features_app = typer.Typer(help="Feature engineering")
 app.add_typer(data_app, name="data")
+app.add_typer(features_app, name="features")
+app.add_typer(backtest_app, name="backtest")
+app.add_typer(forecast_app, name="forecast")
+app.add_typer(agents_app, name="agent")
+app.add_typer(aggregator_app, name="train")
+app.add_typer(rl_app, name="rl")
 
 console = Console()
 
+ALL_KINDS: list[BulkKind] = ["aggTrades", "klines_1m", "klines_5m", "bookDepth", "metrics"]
 
-# Global options
+
 @app.callback()
 def main(
     ctx: typer.Context,
     log_level: Annotated[str, typer.Option(help="Log level")] = "info",
     quiet: Annotated[bool, typer.Option(help="Suppress console logs")] = False,
 ) -> None:
-    """Global configuration."""
     setup_logging(log_level=log_level, console=not quiet)
 
 
-# Data commands
+# ---------------------------------------------------------------------------
+# data download-bulk
+# ---------------------------------------------------------------------------
 
-
-@data_app.command("download")
-def data_download(
-    symbol: Annotated[str, typer.Option(help="Trading symbol")] = "BTCUSDT",
-    venue: Annotated[str, typer.Option(help="Exchange venue")] = "binance",
-    kind: Annotated[
+@data_app.command("download-bulk")
+def data_download_bulk(
+    symbol: Annotated[str, typer.Option(help="Futures symbol")] = "BTCUSDT",
+    kinds: Annotated[
         str,
-        typer.Option(
-            help="Data type: klines_1m, klines_5m, klines_15m, klines_1h, funding, open_interest"
-        ),
-    ] = "klines_5m",
-    start: Annotated[Optional[str], typer.Option(help="Start date (YYYY-MM-DD)")] = None,
-    end: Annotated[Optional[str], typer.Option(help="End date (YYYY-MM-DD)")] = None,
-    offset: Annotated[int, typer.Option(help="Offset from checkpoint in milliseconds")] = 0,
-    data_dir: Annotated[Path, typer.Option(help="Data directory")] = Path("data"),
-    force: Annotated[bool, typer.Option(help="Re-download even if exists")] = False,
+        typer.Option(help=f"Comma-separated kinds: {','.join(ALL_KINDS)} or 'all'"),
+    ] = "all",
+    start: Annotated[Optional[str], typer.Option(help="Start date YYYY-MM-DD")] = None,
+    end: Annotated[Optional[str], typer.Option(help="End date YYYY-MM-DD (default: yesterday)")] = None,
+    data_dir: Annotated[Path, typer.Option(help="Data root directory")] = Path("data"),
+    concurrency: Annotated[int, typer.Option(help="Parallel downloads")] = 8,
 ) -> None:
-    """Download historical data from Binance API.
+    """Download bulk historical data from data.binance.vision.
+
+    Downloads daily Parquet files (aggTrades, klines, bookDepth, metrics).
+    Skips files that already exist. Safe to re-run.
 
     Examples:
-        # Download 12 months of 5m klines
-        intraday data download --kind klines_5m --start 2024-01-01 --end 2024-12-31
+        # Download last 1 month of all kinds
+        intraday data download-bulk --start 2026-05-20
 
-        # Resume from checkpoint
-        intraday data download --kind klines_5m
-
-        # Start from checkpoint + 1 week
-        intraday data download --kind klines_5m --offset 604800000
+        # Download only trades and klines for a specific range
+        intraday data download-bulk --kinds aggTrades,klines_1m,klines_5m \\
+            --start 2026-01-01 --end 2026-06-19
     """
-    config = DownloadConfig(
-        symbol=symbol,
-        venue=venue,
-        kind=kind,
-        start=datetime.fromisoformat(start) if start else None,
-        end=datetime.fromisoformat(end) if end else None,
-        offset_from_checkpoint=offset,
-        data_dir=data_dir,
-        force=force,
+    selected_kinds: list[BulkKind] = ALL_KINDS if kinds == "all" else kinds.split(",")  # type: ignore
+    start_date = date.fromisoformat(start) if start else None
+    end_date = date.fromisoformat(end) if end else None
+
+    rprint(f"[yellow]Downloading {selected_kinds} from data.binance.vision[/yellow]")
+    rprint(f"Range: {start_date or 'auto'} → {end_date or 'yesterday'}")
+    rprint(f"Concurrency: {concurrency} parallel downloads")
+
+    counts = asyncio.run(
+        download_bulk(
+            symbol=symbol,
+            kinds=selected_kinds,
+            start_date=start_date,
+            end_date=end_date,
+            data_dir=data_dir,
+            max_concurrent=concurrency,
+        )
     )
+    rprint("\n[green]✓[/green] Download complete!")
+    for k, n in counts.items():
+        rprint(f"  {k}: {n} new days")
 
-    asyncio.run(download_historical(config))
-    rprint("[green]✓[/green] Download complete!")
 
+# ---------------------------------------------------------------------------
+# data live-capture
+# ---------------------------------------------------------------------------
 
 @data_app.command("live-capture")
 def data_live_capture(
-    symbol: Annotated[str, typer.Option(help="Trading symbol")] = "BTCUSDT",
-    venue: Annotated[str, typer.Option(help="Exchange venue")] = "binance",
+    symbol: Annotated[str, typer.Option(help="Futures symbol")] = "BTCUSDT",
     streams: Annotated[
         str,
-        typer.Option(help="Comma-separated streams: trade,depth,mark_price,liquidations"),
-    ] = "trade,depth,mark_price",
+        typer.Option(help="Comma-separated: aggTrade,depth,mark_price,liquidations"),
+    ] = "aggTrade,depth,mark_price",
     data_dir: Annotated[Path, typer.Option(help="Data directory")] = Path("data"),
     flush_interval: Annotated[int, typer.Option(help="Flush interval in seconds")] = 60,
 ) -> None:
-    """Start live WebSocket data capture.
+    """Start live WebSocket capture from Binance futures streams.
 
+    Uses BTCUSDT perpetual futures (fstream.binance.com).
     Runs indefinitely until interrupted (Ctrl+C).
 
     Examples:
-        # Capture trades and depth
-        intraday data live-capture --streams trade,depth
-
-        # All streams
-        intraday data live-capture --streams trade,depth,mark_price,liquidations
+        intraday data live-capture --streams aggTrade,depth,mark_price
     """
     config = CaptureConfig(
         symbol=symbol,
-        venue=venue,
         streams=streams.split(","),
         data_dir=data_dir,
         flush_interval_s=flush_interval,
@@ -122,51 +138,116 @@ def data_live_capture(
     asyncio.run(capture_live(config))
 
 
+# ---------------------------------------------------------------------------
+# data summary / checkpoint
+# ---------------------------------------------------------------------------
+
 @data_app.command("summary")
 def data_summary(
     data_dir: Annotated[Path, typer.Option(help="Data directory")] = Path("data"),
-    symbol: Annotated[Optional[str], typer.Option(help="Filter by symbol")] = None,
 ) -> None:
     """Show summary of downloaded data."""
     checkpoint_path = get_checkpoint_path(data_dir)
     checkpoint = Checkpoint.load(checkpoint_path)
 
-    if not checkpoint.entries:
-        rprint("[yellow]No data found. Run 'intraday data download' first.[/yellow]")
-        return
+    # Also scan raw parquet files since bulk downloads bypass the checkpoint
+    raw_dir = data_dir / "raw" / "binance"
+    table = Table(title="Raw Data Summary")
+    table.add_column("Kind", style="cyan")
+    table.add_column("Files", justify="right")
+    table.add_column("Date range")
+    table.add_column("Size")
 
-    # Create table
-    table = Table(title="Data Summary")
-    table.add_column("Venue/Kind/Symbol", style="cyan")
-    table.add_column("Start", style="green")
-    table.add_column("End", style="green")
-    table.add_column("Records", justify="right", style="magenta")
-    table.add_column("Files", justify="right", style="blue")
-
-    for key, entry in sorted(checkpoint.entries.items()):
-        if symbol and entry.symbol != symbol:
-            continue
-
-        table.add_row(
-            key,
-            entry.start_time.strftime("%Y-%m-%d %H:%M"),
-            entry.end_time.strftime("%Y-%m-%d %H:%M"),
-            f"{entry.num_records:,}",
-            str(entry.num_files),
-        )
+    if raw_dir.exists():
+        for kind_dir in sorted(raw_dir.iterdir()):
+            if not kind_dir.is_dir():
+                continue
+            for symbol_dir in kind_dir.iterdir():
+                files = sorted(symbol_dir.glob("*.parquet"))
+                if not files:
+                    continue
+                dates = [f.stem for f in files]
+                total_kb = sum(f.stat().st_size for f in files) / 1024
+                size_str = f"{total_kb/1024:.1f} MB" if total_kb > 1024 else f"{total_kb:.0f} KB"
+                table.add_row(
+                    f"{kind_dir.name}/{symbol_dir.name}",
+                    str(len(files)),
+                    f"{dates[0]} → {dates[-1]}",
+                    size_str,
+                )
 
     console.print(table)
 
 
-@data_app.command("checkpoint")
-def data_checkpoint(
-    data_dir: Annotated[Path, typer.Option(help="Data directory")] = Path("data"),
-) -> None:
-    """Show checkpoint details."""
-    checkpoint_path = get_checkpoint_path(data_dir)
-    checkpoint = Checkpoint.load(checkpoint_path)
+# ---------------------------------------------------------------------------
+# features compute
+# ---------------------------------------------------------------------------
 
-    rprint(checkpoint.summary())
+@features_app.command("compute")
+def features_compute(
+    symbol: Annotated[str, typer.Option(help="Symbol")] = "BTCUSDT",
+    start: Annotated[Optional[str], typer.Option(help="Start date YYYY-MM-DD")] = None,
+    end: Annotated[Optional[str], typer.Option(help="End date YYYY-MM-DD")] = None,
+    data_dir: Annotated[Path, typer.Option(help="Data root")] = Path("data"),
+    force: Annotated[bool, typer.Option(help="Recompute existing days")] = False,
+    vpin_bucket: Annotated[float, typer.Option(help="VPIN bucket size in BTC")] = 100.0,
+    vpin_window: Annotated[int,   typer.Option(help="VPIN rolling window (buckets)")] = 50,
+) -> None:
+    """Compute feature rows (price, volume, depth, VPIN, Hawkes) from raw Parquet.
+
+    Processes one day at a time — no OOM risk regardless of date range.
+    Rolling state (VPIN, Hawkes) carries across day boundaries.
+
+    Output: data/features/{symbol}/YYYY-MM-DD.parquet (288 rows per day)
+
+    Examples:
+        intraday features compute --start 2026-05-20 --end 2026-06-19
+    """
+    from intraday.features.pipeline import TransformationPipeline
+
+    start_date = date.fromisoformat(start) if start else date(2026, 5, 20)
+    end_date   = date.fromisoformat(end)   if end   else date.today()
+
+    rprint(f"[yellow]Computing features for {symbol}[/yellow]")
+    rprint(f"Range     : {start_date} → {end_date}")
+    rprint(f"VPIN      : bucket={vpin_bucket} BTC, window={vpin_window} buckets")
+    rprint(f"Hawkes    : α=1.0, β=10.0/s, μ=6.0")
+    rprint(f"Output    : {data_dir}/features/{symbol}/")
+
+    pipeline = TransformationPipeline(
+        data_dir=data_dir, symbol=symbol,
+        vpin_bucket_btc=vpin_bucket, vpin_window=vpin_window,
+    )
+    total = pipeline.run(start_date, end_date, force=force)
+    rprint(f"\n[green]✓[/green] {total:,} feature rows written")
+
+
+@features_app.command("summary")
+def features_summary(
+    data_dir: Annotated[Path, typer.Option(help="Data root")] = Path("data"),
+    symbol: Annotated[str, typer.Option(help="Symbol")] = "BTCUSDT",
+) -> None:
+    """Show feature store summary."""
+    features_dir = data_dir / "features" / symbol
+    if not features_dir.exists():
+        rprint("[yellow]No features yet. Run: intraday features compute[/yellow]")
+        return
+
+    files = sorted(features_dir.glob("*.parquet"))
+    if not files:
+        rprint("[yellow]No feature files found.[/yellow]")
+        return
+
+    total_rows = 0
+    for f in files:
+        import polars as pl
+        df = pl.scan_parquet(f).select("bar_time_ms").collect()
+        total_rows += len(df)
+
+    rprint(f"Feature files : {len(files)}")
+    rprint(f"Date range    : {files[0].stem} → {files[-1].stem}")
+    rprint(f"Total rows    : {total_rows:,}")
+    rprint(f"Directory     : {features_dir}")
 
 
 if __name__ == "__main__":

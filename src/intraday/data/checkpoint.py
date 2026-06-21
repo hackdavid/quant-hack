@@ -18,7 +18,7 @@ class CheckpointEntry(BaseModel):
     """Single checkpoint entry for a data stream."""
 
     symbol: str
-    venue: Literal["binance", "coinbase", "deribit"]
+    venue: Literal["binance", "coinbase", "deribit", "okx"]
     kind: Literal[
         "klines_1m",
         "klines_5m",
