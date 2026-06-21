@@ -3,8 +3,12 @@
 Pipeline:
   1. Load features + labels, compute triple-barrier labels
   2. Build ForecastDataset (purged train/val split)
-  3. Load frozen Kronos + KronosTokenizer
-  4. Train SmallTCN + ForecastHead with CrossEntropyLoss + AdamW + cosine LR
+  3. Load Kronos (frozen or with LoRA on top-K layers) + KronosTokenizer
+  4. Train SmallTCN + ForecastHead (+ optional LoRA params) with:
+       - CrossEntropyLoss (label_smoothing=0.05)
+       - AdamW with separate LR groups for LoRA vs TCN/head
+       - Linear warmup → cosine decay LR schedule
+       - Gradient accumulation for large effective batch sizes
   5. Train MetaLabelClassifier (purged k-fold)
   6. Fit IsotonicCalibrator on validation predictions
   7. Save all artefacts + checkpoints to output_dir
@@ -14,13 +18,13 @@ Checkpoint / resume:
   Pass resume_from=<path> to restart from a saved checkpoint.
 
 Smoke-test:
-  Set max_batches=1 to run exactly one forward+backward batch and exit —
-  useful to verify the full pipeline before committing to a long run.
+  Set max_batches=1 to run exactly one forward+backward batch and exit.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import pickle
 import random
 import time
@@ -65,6 +69,22 @@ def _fmt_seconds(s: float) -> str:
     if m:
         return f"{m}m{sec:02d}s"
     return f"{sec}s"
+
+
+def _warmup_cosine_schedule(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr_ratio: float = 0.05,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Linear warmup then cosine decay to min_lr_ratio × peak_lr."""
+    def _lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
 
 def _save_checkpoint(
@@ -118,11 +138,16 @@ def train_forecast(
     val_end: date,
     kronos_checkpoint: Path,
     tokenizer_checkpoint: Path,
-    lora_rank: int = 8,
-    epochs: int = 5,
+    unfreeze_top_k: int = 0,
+    lora_rank: int = 16,
+    lora_alpha: int = 32,
+    epochs: int = 10,
     batch_size: int = 8,
+    grad_accum: int = 1,
+    lr_lora: float = 5e-5,
     lr_tcn_head: float = 2e-4,
     weight_decay: float = 1e-2,
+    warmup_steps: int = 500,
     device: str = "auto",
     seed: int = 42,
     max_batches: int | None = None,
@@ -140,17 +165,24 @@ def train_forecast(
         val_end:              Last date of validation window.
         kronos_checkpoint:    Path to Kronos-base model directory.
         tokenizer_checkpoint: Path to Kronos-Tokenizer-base directory.
-        lora_rank:            Kept for API compatibility; Kronos is frozen.
-        epochs:               Training epochs (skipped in smoke-test mode).
-        batch_size:           Mini-batch size (use 4-8 on CPU).
-        lr_tcn_head:          Learning rate for TCN + head parameters.
+        unfreeze_top_k:       Number of top Kronos transformer layers to
+                              fine-tune via LoRA. 0 = fully frozen (CPU/smoke).
+                              4 = recommended for GPU runs (213K extra params).
+        lora_rank:            LoRA rank r (default 16).
+        lora_alpha:           LoRA alpha scaling (default 32 = 2×rank).
+        epochs:               Training epochs.
+        batch_size:           Mini-batch size per step (4-8 on CPU, 32-64 GPU).
+        grad_accum:           Gradient accumulation steps. Effective batch =
+                              batch_size × grad_accum. Use 4 on GPU for 128.
+        lr_lora:              Learning rate for LoRA parameters (lower, 5e-5).
+        lr_tcn_head:          Learning rate for TCN + head (2e-4).
         weight_decay:         AdamW weight decay.
+        warmup_steps:         Linear LR warmup steps before cosine decay.
         device:               "auto" | "cpu" | "cuda" | "mps".
         seed:                 Random seed.
-        max_batches:          If set, stop after this many batches per epoch
-                              (set to 1 for a smoke test).
-        resume_from:          Path to a checkpoint_epoch*.pt file to resume.
-        log_every:            Print progress every N steps.
+        max_batches:          Stop after this many batches (1 = smoke test).
+        resume_from:          Path to checkpoint_epoch*.pt to resume from.
+        log_every:            Print progress every N optimizer steps.
 
     Returns:
         Path to the output directory.
@@ -233,14 +265,21 @@ def train_forecast(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=0, pin_memory=pin)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=pin)
 
-    # ── 3. Load frozen Kronos ─────────────────────────────────────────────
-    print("[3/7] Loading frozen Kronos model...")
+    # ── 3. Load Kronos (frozen or LoRA on top-k layers) ───────────────────
+    mode_label = f"LoRA top-{unfreeze_top_k} layers" if unfreeze_top_k > 0 else "fully frozen"
+    print(f"[3/7] Loading Kronos ({mode_label})...")
     kronos_model, tokenizer, kronos_cfg = load_kronos(
         model_checkpoint=Path(kronos_checkpoint),
         tokenizer_checkpoint=Path(tokenizer_checkpoint),
         device=dev,
+        unfreeze_top_k=unfreeze_top_k,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
     )
-    kronos_hidden = int(kronos_cfg["d_model"])  # 832
+    kronos_hidden  = int(kronos_cfg["d_model"])           # 832
+    lora_trainable = int(kronos_cfg.get("lora_trainable", 0))
+    if lora_trainable:
+        print(f"    LoRA trainable params: {lora_trainable:,} ({100*lora_trainable/102_310_592:.2f}% of Kronos)")
 
     # ── 4. Build trainable components ────────────────────────────────────
     print("[4/7] Building TCN + ForecastHead...")
@@ -248,14 +287,24 @@ def train_forecast(
     tcn  = SmallTCN(n_features=n_features, channels=64, dropout=0.1).to(dev)
     head = ForecastHead(kronos_dim=kronos_hidden, tcn_dim=64, hidden=256, n_bins=11, dropout=0.1).to(dev)
 
-    optimizer = torch.optim.AdamW(
-        list(tcn.parameters()) + list(head.parameters()),
-        lr=lr_tcn_head,
-        weight_decay=weight_decay,
-    )
-    total_steps = epochs * (min(len(train_loader), max_batches) if max_batches else len(train_loader))
-    scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(total_steps, 1), eta_min=1e-6)
+    # Separate LR for LoRA (lower) vs TCN/head (higher)
+    param_groups: list[dict] = []
+    lora_params = [p for p in kronos_model.parameters() if p.requires_grad]
+    if lora_params:
+        param_groups.append({"params": lora_params, "lr": lr_lora, "weight_decay": 0.01})
+    param_groups.append({
+        "params": list(tcn.parameters()) + list(head.parameters()),
+        "lr": lr_tcn_head,
+        "weight_decay": weight_decay,
+    })
+
+    optimizer   = torch.optim.AdamW(param_groups, betas=(0.9, 0.95))
+    steps_per_epoch = (min(len(train_loader), max_batches) if max_batches else len(train_loader))
+    total_steps = epochs * math.ceil(steps_per_epoch / grad_accum)
+    scheduler   = _warmup_cosine_schedule(optimizer, warmup_steps=warmup_steps, total_steps=total_steps)
     criterion   = nn.CrossEntropyLoss(label_smoothing=0.05)
+    eff_batch   = batch_size * grad_accum
+    print(f"    effective batch={eff_batch}  warmup={warmup_steps}  total_opt_steps={total_steps}")
 
     # ── 5. Resume from checkpoint ─────────────────────────────────────────
     start_epoch    = 1
@@ -292,54 +341,78 @@ def train_forecast(
         epoch_t0       = time.time()
         step_times: list[float] = []
 
+        # Whether Kronos gradients flow (LoRA mode)
+        kronos_grads = unfreeze_top_k > 0
+        all_trainable = (
+            list(kronos_model.parameters() if kronos_grads else [])
+            + list(tcn.parameters())
+            + list(head.parameters())
+        )
+        accum_loss = 0.0
+
         for batch_idx, (klines_norm, klines_raw, klines_stamp, state_win, labels, _) in enumerate(train_loader):
             if max_batches is not None and batch_idx >= max_batches:
                 break
 
-            step_t0     = time.time()
-            klines_raw  = klines_raw.to(dev)    # (B, 256, 6)
-            klines_stamp = klines_stamp.to(dev) # (B, 256, 5)
-            state_win   = state_win.to(dev)      # (B, 128, n_feat)
-            labels      = labels.to(dev)
+            step_t0      = time.time()
+            klines_raw   = klines_raw.to(dev)
+            klines_stamp = klines_stamp.to(dev)
+            state_win    = state_win.to(dev)
+            labels       = labels.to(dev)
 
-            optimizer.zero_grad(set_to_none=True)
-
-            kronos_emb = kronos_embed(kronos_model, tokenizer, klines_raw, klines_stamp)  # (B, 832)
-            tcn_emb    = tcn(state_win)                                                    # (B, 64)
-            logits     = head(kronos_emb, tcn_emb)                                         # (B, 11)
-            loss       = criterion(logits, labels)
-
+            # Forward
+            kronos_emb = kronos_embed(
+                kronos_model, tokenizer, klines_raw, klines_stamp,
+                no_grad=not kronos_grads,
+            )
+            tcn_emb = tcn(state_win)
+            logits  = head(kronos_emb, tcn_emb)
+            # Normalise loss by accumulation steps so scale is independent of grad_accum
+            loss = criterion(logits, labels) / grad_accum
             loss.backward()
-            nn.utils.clip_grad_norm_(list(tcn.parameters()) + list(head.parameters()), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
+            accum_loss += float(loss.item())
 
-            step_dt = time.time() - step_t0
-            step_times.append(step_dt)
-            if len(step_times) > 20:
-                step_times.pop(0)
+            is_update_step = (batch_idx + 1) % grad_accum == 0
+            is_last_batch  = (batch_idx + 1) == (max_batches or len(train_loader))
 
-            train_loss_sum += float(loss.item())
-            train_steps    += 1
-            global_step    += 1
+            if is_update_step or is_last_batch:
+                nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            if (batch_idx + 1) % log_every == 0 or batch_idx == 0:
-                avg_step  = sum(step_times) / len(step_times)
-                remaining = (len(train_loader) - batch_idx - 1) * avg_step
-                if max_batches:
-                    remaining = 0.0
-                lr_now = optimizer.param_groups[0]["lr"]
-                print(
-                    f"  [E{epoch}/{epochs} | step {batch_idx+1:>4}/{len(train_loader)}] "
-                    f"loss={loss.item():.4f}  lr={lr_now:.2e}  "
-                    f"{avg_step:.2f}s/step  ETA {_fmt_seconds(remaining)}"
-                )
-                log.info(
-                    "train_forecast.step",
-                    epoch=epoch, step=batch_idx + 1, total_steps=len(train_loader),
-                    loss=round(float(loss.item()), 4), lr=round(lr_now, 8),
-                    secs_per_step=round(avg_step, 2),
-                )
+                step_dt = time.time() - step_t0
+                step_times.append(step_dt)
+                if len(step_times) > 20:
+                    step_times.pop(0)
+
+                opt_step    = (batch_idx + 1) // grad_accum
+                total_opt   = len(train_loader) // grad_accum
+                train_loss_sum += accum_loss
+                train_steps    += 1
+                global_step    += 1
+                accum_loss      = 0.0
+
+                if opt_step % log_every == 0 or opt_step == 1:
+                    avg_step  = sum(step_times) / len(step_times)
+                    remaining = (total_opt - opt_step) * avg_step
+                    if max_batches:
+                        remaining = 0.0
+                    lr_now = optimizer.param_groups[-1]["lr"]
+                    lr_lora_now = optimizer.param_groups[0]["lr"] if len(optimizer.param_groups) > 1 else lr_now
+                    lr_str = (f"lr_lora={lr_lora_now:.2e} lr_head={lr_now:.2e}"
+                              if kronos_grads else f"lr={lr_now:.2e}")
+                    print(
+                        f"  [E{epoch}/{epochs} | opt_step {opt_step:>4}/{total_opt}] "
+                        f"loss={train_loss_sum/train_steps:.4f}  {lr_str}  "
+                        f"{avg_step:.2f}s/step  ETA {_fmt_seconds(remaining)}"
+                    )
+                    log.info(
+                        "train_forecast.step",
+                        epoch=epoch, opt_step=opt_step, total_opt_steps=total_opt,
+                        loss=round(train_loss_sum / train_steps, 4),
+                        lr=round(lr_now, 8), secs_per_step=round(avg_step, 2),
+                    )
 
         avg_train = train_loss_sum / max(train_steps, 1)
 
@@ -357,9 +430,11 @@ def train_forecast(
             print(f"Checkpoint saved: {output_dir / 'checkpoint_smoke.pt'}")
             return _save_artefacts(
                 output_dir=output_dir, tcn=tcn, head=head,
+                kronos_model=kronos_model if unfreeze_top_k > 0 else None,
                 train_ds=train_ds, model_version=model_version,
                 train_end=train_end, val_start=val_start, val_end=val_end,
                 epochs=epochs, batch_size=batch_size, lora_rank=lora_rank,
+                unfreeze_top_k=unfreeze_top_k, grad_accum=grad_accum,
                 kronos_hidden=kronos_hidden, n_features=n_features, dev=dev, seed=seed,
                 best_val_loss=avg_train, meta_metrics={"auc": 0.0, "brier": 0.5},
                 calibrator=None,
@@ -444,9 +519,11 @@ def train_forecast(
 
     return _save_artefacts(
         output_dir=output_dir, tcn=tcn, head=head,
+        kronos_model=kronos_model if unfreeze_top_k > 0 else None,
         train_ds=train_ds, model_version=model_version,
         train_end=train_end, val_start=val_start, val_end=val_end,
         epochs=epochs, batch_size=batch_size, lora_rank=lora_rank,
+        unfreeze_top_k=unfreeze_top_k, grad_accum=grad_accum,
         kronos_hidden=kronos_hidden, n_features=n_features, dev=dev, seed=seed,
         best_val_loss=best_val_loss, meta_metrics=meta_metrics,
         calibrator=calibrator,
@@ -548,6 +625,7 @@ def _save_artefacts(
     output_dir: Path,
     tcn: nn.Module,
     head: nn.Module,
+    kronos_model: nn.Module | None,
     train_ds: Any,
     model_version: str,
     train_end: date,
@@ -556,6 +634,8 @@ def _save_artefacts(
     epochs: int,
     batch_size: int,
     lora_rank: int,
+    unfreeze_top_k: int,
+    grad_accum: int,
     kronos_hidden: int,
     n_features: int,
     dev: torch.device,
@@ -573,6 +653,15 @@ def _save_artefacts(
         torch.save(tcn.state_dict(),  output_dir / "tcn.pt")
         torch.save(head.state_dict(), output_dir / "head.pt")
 
+    # Save LoRA weights separately if Kronos was fine-tuned
+    if kronos_model is not None:
+        lora_state = {
+            k: v for k, v in kronos_model.state_dict().items()
+            if "lora_A" in k or "lora_B" in k
+        }
+        torch.save(lora_state, output_dir / "kronos_lora.pt")
+        print(f"  LoRA weights saved: {len(lora_state)} tensors → kronos_lora.pt")
+
     with open(output_dir / "klines_norm.pkl", "wb") as fh:
         pickle.dump(train_ds.klines_norm, fh)
     with open(output_dir / "state_norm.pkl", "wb") as fh:
@@ -585,7 +674,10 @@ def _save_artefacts(
         "val_end": str(val_end),
         "epochs": epochs,
         "batch_size": batch_size,
+        "effective_batch": batch_size * grad_accum,
+        "grad_accum": grad_accum,
         "lora_rank": lora_rank,
+        "unfreeze_top_k": unfreeze_top_k,
         "kronos_hidden": kronos_hidden,
         "n_features": n_features,
         "seq_klines": 256,

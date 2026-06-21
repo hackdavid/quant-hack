@@ -27,11 +27,16 @@ def forecast_train(
     val_end: Annotated[Optional[str], typer.Option(help="Validation end date YYYY-MM-DD")] = None,
     kronos_checkpoint: Annotated[Path, typer.Option(help="Path to Kronos-base model directory")] = Path("models/kronos-base"),
     tokenizer_checkpoint: Annotated[Path, typer.Option(help="Path to Kronos-Tokenizer-base directory")] = Path("models/kronos-tokenizer"),
-    epochs: Annotated[int, typer.Option(help="Training epochs")] = 5,
-    batch_size: Annotated[int, typer.Option(help="Mini-batch size (4-8 on CPU)")] = 4,
-    lora_rank: Annotated[int, typer.Option(help="LoRA rank (kept for compat; Kronos is frozen)")] = 8,
+    epochs: Annotated[int, typer.Option(help="Training epochs")] = 10,
+    batch_size: Annotated[int, typer.Option(help="Mini-batch size per step (4-8 CPU, 32-64 GPU)")] = 4,
+    grad_accum: Annotated[int, typer.Option(help="Gradient accumulation steps (effective batch = batch×accum)")] = 1,
+    unfreeze_top_k: Annotated[int, typer.Option(help="Fine-tune last K Kronos layers via LoRA (0=frozen, 4=GPU recommended)")] = 0,
+    lora_rank: Annotated[int, typer.Option(help="LoRA rank r (default 16)")] = 16,
+    lora_alpha: Annotated[int, typer.Option(help="LoRA alpha scaling (default 32)")] = 32,
+    lr_lora: Annotated[float, typer.Option(help="Learning rate for LoRA params (lower)")] = 5e-5,
     lr_head: Annotated[float, typer.Option(help="Learning rate for TCN+head")] = 2e-4,
     weight_decay: Annotated[float, typer.Option(help="AdamW weight decay")] = 1e-2,
+    warmup_steps: Annotated[int, typer.Option(help="LR warmup steps before cosine decay")] = 500,
     device: Annotated[str, typer.Option(help="Device: auto | cpu | cuda | mps")] = "auto",
     seed: Annotated[int, typer.Option(help="Random seed")] = 42,
     data_dir: Annotated[Path, typer.Option(help="Root data directory")] = Path("data"),
@@ -39,7 +44,7 @@ def forecast_train(
     symbol: Annotated[str, typer.Option(help="Symbol")] = "BTCUSDT",
     smoke_test: Annotated[bool, typer.Option("--smoke-test", help="Run 1 batch to verify the pipeline, then exit")] = False,
     resume_from: Annotated[Optional[Path], typer.Option(help="Resume from a checkpoint_epoch*.pt file")] = None,
-    log_every: Annotated[int, typer.Option(help="Print progress every N steps")] = 10,
+    log_every: Annotated[int, typer.Option(help="Print progress every N optimizer steps")] = 10,
 ) -> None:
     """Train the Kronos + TCN + meta-label forecast model.
 
@@ -100,7 +105,9 @@ def forecast_train(
     rprint(f"  Kronos model : {kronos_checkpoint}")
     rprint(f"  Kronos tok   : {tokenizer_checkpoint}")
     rprint(f"  output_dir   : {output_dir}")
-    rprint(f"  epochs={epochs}  batch={batch_size}  device={device}")
+    rprint(f"  epochs={epochs}  batch={batch_size}  grad_accum={grad_accum}  eff_batch={batch_size*grad_accum}")
+    rprint(f"  unfreeze_top_k={unfreeze_top_k}  lora_rank={lora_rank}  warmup={warmup_steps}")
+    rprint(f"  device={device}")
     if smoke_test:
         rprint("  [bold red]SMOKE TEST MODE — 1 batch only[/bold red]")
     if resume_from:
@@ -131,11 +138,16 @@ def forecast_train(
             val_end=_val_end,
             kronos_checkpoint=kronos_checkpoint,
             tokenizer_checkpoint=tokenizer_checkpoint,
+            unfreeze_top_k=unfreeze_top_k,
             lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
             epochs=epochs,
             batch_size=batch_size,
+            grad_accum=grad_accum,
+            lr_lora=lr_lora,
             lr_tcn_head=lr_head,
             weight_decay=weight_decay,
+            warmup_steps=warmup_steps,
             device=device,
             seed=seed,
             max_batches=1 if smoke_test else None,
