@@ -38,6 +38,7 @@ import structlog
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 log = structlog.get_logger(__name__)
 
@@ -226,7 +227,7 @@ def train_forecast(
     bars_df = pl.concat(all_frames).sort("bar_time_ms")
 
     log.info("train_forecast.computing_labels", n_bars=len(bars_df))
-    labeled_df = triple_barrier_labels(bars_df, pt_sl=(1.5, 1.0), horizon_minutes=15, vol_window_minutes=60)
+    labeled_df = triple_barrier_labels(bars_df, pt_sl=(1.0, 1.0), horizon_minutes=15, vol_window_minutes=60)
 
     train_end_ms = _date_to_ms(train_end, end_of_day=True)
     val_start_ms = _date_to_ms(val_start, end_of_day=False)
@@ -246,14 +247,14 @@ def train_forecast(
         klines_dir=klines_dir,
         features_dir=features_dir,
         labels_df=train_labels,
-        seq_klines=256,
+        seq_klines=512,
         seq_state=128,
     )
     val_ds = ForecastDataset(
         klines_dir=klines_dir,
         features_dir=features_dir,
         labels_df=val_labels,
-        seq_klines=256,
+        seq_klines=512,
         seq_state=128,
         klines_norm=train_ds.klines_norm,
         state_norm=train_ds.state_norm,
@@ -284,8 +285,8 @@ def train_forecast(
     # ── 4. Build trainable components ────────────────────────────────────
     print("[4/7] Building TCN + ForecastHead...")
     from intraday.forecast.tcn import SmallTCN
-    tcn  = SmallTCN(n_features=n_features, channels=64, dropout=0.1).to(dev)
-    head = ForecastHead(kronos_dim=kronos_hidden, tcn_dim=64, hidden=256, n_bins=11, dropout=0.1).to(dev)
+    tcn  = SmallTCN(n_features=n_features, channels=128, dropout=0.1).to(dev)
+    head = ForecastHead(kronos_dim=kronos_hidden, tcn_dim=128, hidden=256, n_bins=2, dropout=0.1).to(dev)
 
     # Separate LR for LoRA (lower) vs TCN/head (higher)
     param_groups: list[dict] = []
@@ -302,9 +303,12 @@ def train_forecast(
     steps_per_epoch = (min(len(train_loader), max_batches) if max_batches else len(train_loader))
     total_steps = epochs * math.ceil(steps_per_epoch / grad_accum)
     scheduler   = _warmup_cosine_schedule(optimizer, warmup_steps=warmup_steps, total_steps=total_steps)
-    criterion   = nn.CrossEntropyLoss(label_smoothing=0.05)
+    criterion   = nn.CrossEntropyLoss()
     eff_batch   = batch_size * grad_accum
+    amp_enabled = dev.type == "cuda"
+    scaler      = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     print(f"    effective batch={eff_batch}  warmup={warmup_steps}  total_opt_steps={total_steps}")
+    print(f"    AMP mixed-precision: {'ON (fp16 activations)' if amp_enabled else 'OFF'}")
 
     # ── 5. Resume from checkpoint ─────────────────────────────────────────
     start_epoch    = 1
@@ -333,92 +337,104 @@ def train_forecast(
     all_val_logits: list[np.ndarray] = []
     all_val_labels: list[np.ndarray] = []
 
-    for epoch in range(start_epoch, epochs + 1):
+    kronos_grads = unfreeze_top_k > 0
+    all_trainable = (
+        list(kronos_model.parameters() if kronos_grads else [])
+        + list(tcn.parameters())
+        + list(head.parameters())
+    )
+    total_opt_per_epoch = math.ceil((min(len(train_loader), max_batches)
+                                     if max_batches else len(train_loader)) / grad_accum)
+
+    epoch_bar = tqdm(
+        range(start_epoch, epochs + 1),
+        desc="Training", unit="ep",
+        position=0, leave=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} ep [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+
+    for epoch in epoch_bar:
         # ── Train ──────────────────────────────────────────────────────────
         tcn.train(); head.train()
         train_loss_sum = 0.0
         train_steps    = 0
         epoch_t0       = time.time()
-        step_times: list[float] = []
+        accum_loss     = 0.0
 
-        # Whether Kronos gradients flow (LoRA mode)
-        kronos_grads = unfreeze_top_k > 0
-        all_trainable = (
-            list(kronos_model.parameters() if kronos_grads else [])
-            + list(tcn.parameters())
-            + list(head.parameters())
+        step_bar = tqdm(
+            total=total_opt_per_epoch,
+            desc=f"  Ep {epoch:02d}/{epochs} train",
+            unit="step", position=1, leave=False,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
         )
-        accum_loss = 0.0
 
         for batch_idx, (klines_norm, klines_raw, klines_stamp, state_win, labels, _) in enumerate(train_loader):
             if max_batches is not None and batch_idx >= max_batches:
                 break
 
-            step_t0      = time.time()
-            klines_raw   = klines_raw.to(dev)
-            klines_stamp = klines_stamp.to(dev)
-            state_win    = state_win.to(dev)
-            labels       = labels.to(dev)
+            klines_raw   = klines_raw.to(dev, non_blocking=True)
+            klines_stamp = klines_stamp.to(dev, non_blocking=True)
+            state_win    = state_win.to(dev, non_blocking=True)
+            labels       = labels.to(dev, non_blocking=True)
 
-            # Forward
-            kronos_emb = kronos_embed(
-                kronos_model, tokenizer, klines_raw, klines_stamp,
-                no_grad=not kronos_grads,
-            )
-            tcn_emb = tcn(state_win)
-            logits  = head(kronos_emb, tcn_emb)
-            # Normalise loss by accumulation steps so scale is independent of grad_accum
-            loss = criterion(logits, labels) / grad_accum
-            loss.backward()
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                kronos_emb = kronos_embed(
+                    kronos_model, tokenizer, klines_raw, klines_stamp,
+                    no_grad=not kronos_grads,
+                )
+                tcn_emb = tcn(state_win)
+                logits  = head(kronos_emb, tcn_emb)
+                loss    = criterion(logits, labels) / grad_accum
+
+            scaler.scale(loss).backward()
             accum_loss += float(loss.item())
 
             is_update_step = (batch_idx + 1) % grad_accum == 0
             is_last_batch  = (batch_idx + 1) == (max_batches or len(train_loader))
 
             if is_update_step or is_last_batch:
+                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
-                step_dt = time.time() - step_t0
-                step_times.append(step_dt)
-                if len(step_times) > 20:
-                    step_times.pop(0)
-
-                opt_step    = (batch_idx + 1) // grad_accum
-                total_opt   = len(train_loader) // grad_accum
+                opt_step        = (batch_idx + 1) // grad_accum
                 train_loss_sum += accum_loss
                 train_steps    += 1
                 global_step    += 1
                 accum_loss      = 0.0
 
+                lr_now      = optimizer.param_groups[-1]["lr"]
+                lr_lora_now = optimizer.param_groups[0]["lr"] if len(optimizer.param_groups) > 1 else lr_now
+                running_avg = train_loss_sum / train_steps
+
+                step_bar.update(1)
+                step_bar.set_postfix(
+                    loss=f"{running_avg:.4f}",
+                    lr_lora=f"{lr_lora_now:.1e}" if kronos_grads else None,
+                    lr=f"{lr_now:.1e}",
+                    gpu=f"{torch.cuda.memory_allocated()/1024**2:.0f}MB",
+                )
+
                 if opt_step % log_every == 0 or opt_step == 1:
-                    avg_step  = sum(step_times) / len(step_times)
-                    remaining = (total_opt - opt_step) * avg_step
-                    if max_batches:
-                        remaining = 0.0
-                    lr_now = optimizer.param_groups[-1]["lr"]
-                    lr_lora_now = optimizer.param_groups[0]["lr"] if len(optimizer.param_groups) > 1 else lr_now
-                    lr_str = (f"lr_lora={lr_lora_now:.2e} lr_head={lr_now:.2e}"
-                              if kronos_grads else f"lr={lr_now:.2e}")
-                    print(
-                        f"  [E{epoch}/{epochs} | opt_step {opt_step:>4}/{total_opt}] "
-                        f"loss={train_loss_sum/train_steps:.4f}  {lr_str}  "
-                        f"{avg_step:.2f}s/step  ETA {_fmt_seconds(remaining)}"
-                    )
                     log.info(
                         "train_forecast.step",
-                        epoch=epoch, opt_step=opt_step, total_opt_steps=total_opt,
-                        loss=round(train_loss_sum / train_steps, 4),
-                        lr=round(lr_now, 8), secs_per_step=round(avg_step, 2),
+                        epoch=epoch, opt_step=opt_step,
+                        total_opt_steps=total_opt_per_epoch,
+                        loss=round(running_avg, 4),
+                        lr=round(lr_now, 8),
                     )
 
+        step_bar.close()
         avg_train = train_loss_sum / max(train_steps, 1)
 
         if is_smoke:
-            print(f"\n[SMOKE TEST DONE] train_loss={avg_train:.4f}  ({_fmt_seconds(time.time()-epoch_t0)})")
-            print("Pipeline verified — all components functional.\n")
+            epoch_bar.close()
+            elapsed = _fmt_seconds(time.time() - epoch_t0)
+            tqdm.write(f"\n[SMOKE TEST DONE] train_loss={avg_train:.4f}  ({elapsed})")
+            tqdm.write("Pipeline verified — all components functional.\n")
             log.info("train_forecast.smoke_test_done", train_loss=round(avg_train, 4))
             _save_checkpoint(
                 output_dir / "checkpoint_smoke.pt",
@@ -427,7 +443,7 @@ def train_forecast(
                 best_val_loss=best_val_loss,
                 klines_norm=train_ds.klines_norm, state_norm=train_ds.state_norm,
             )
-            print(f"Checkpoint saved: {output_dir / 'checkpoint_smoke.pt'}")
+            tqdm.write(f"Checkpoint saved: {output_dir / 'checkpoint_smoke.pt'}")
             return _save_artefacts(
                 output_dir=output_dir, tcn=tcn, head=head,
                 kronos_model=kronos_model if unfreeze_top_k > 0 else None,
@@ -447,30 +463,41 @@ def train_forecast(
         epoch_val_logits: list[np.ndarray] = []
         epoch_val_labels: list[np.ndarray] = []
 
+        val_bar = tqdm(
+            val_loader,
+            desc=f"  Ep {epoch:02d}/{epochs} val  ",
+            unit="batch", position=1, leave=False,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}] {postfix}",
+        )
         with torch.no_grad():
-            for klines_norm, klines_raw, klines_stamp, state_win, labels, _ in val_loader:
-                klines_raw   = klines_raw.to(dev)
-                klines_stamp = klines_stamp.to(dev)
-                state_win    = state_win.to(dev)
-                labels       = labels.to(dev)
+            for klines_norm, klines_raw, klines_stamp, state_win, labels, _ in val_bar:
+                klines_raw   = klines_raw.to(dev, non_blocking=True)
+                klines_stamp = klines_stamp.to(dev, non_blocking=True)
+                state_win    = state_win.to(dev, non_blocking=True)
+                labels       = labels.to(dev, non_blocking=True)
 
-                kronos_emb = kronos_embed(kronos_model, tokenizer, klines_raw, klines_stamp)
-                tcn_emb    = tcn(state_win)
-                logits     = head(kronos_emb, tcn_emb)
-                loss       = criterion(logits, labels)
+                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    kronos_emb = kronos_embed(kronos_model, tokenizer, klines_raw, klines_stamp)
+                    tcn_emb    = tcn(state_win)
+                    logits     = head(kronos_emb, tcn_emb)
+                    loss       = criterion(logits, labels)
 
                 val_loss_sum += float(loss.item())
                 val_steps    += 1
                 epoch_val_logits.append(logits.cpu().numpy())
                 epoch_val_labels.append(labels.cpu().numpy())
+                val_bar.set_postfix(val_loss=f"{val_loss_sum/val_steps:.4f}")
 
+        val_bar.close()
         avg_val   = val_loss_sum / max(val_steps, 1)
         epoch_sec = time.time() - epoch_t0
+        improved  = avg_val < best_val_loss
 
-        print(
-            f"\n  ── Epoch {epoch}/{epochs} done ──  "
-            f"train={avg_train:.4f}  val={avg_val:.4f}  "
-            f"time={_fmt_seconds(epoch_sec)}"
+        tqdm.write(
+            f"  Ep {epoch:02d}/{epochs}  "
+            f"train={avg_train:.4f}  val={avg_val:.4f}"
+            f"{'  ← best' if improved else ''}  "
+            f"[{_fmt_seconds(epoch_sec)}]"
         )
         log.info(
             "train_forecast.epoch_done",
@@ -478,6 +505,11 @@ def train_forecast(
             train_loss=round(avg_train, 4),
             val_loss=round(avg_val, 4),
             epoch_secs=round(epoch_sec, 1),
+        )
+        epoch_bar.set_postfix(
+            train=f"{avg_train:.4f}",
+            val=f"{avg_val:.4f}",
+            best=f"{min(best_val_loss, avg_val):.4f}",
         )
 
         # Save epoch checkpoint
@@ -489,9 +521,8 @@ def train_forecast(
             best_val_loss=best_val_loss,
             klines_norm=train_ds.klines_norm, state_norm=train_ds.state_norm,
         )
-        print(f"  Checkpoint: {ckpt_path.name}")
 
-        if avg_val < best_val_loss:
+        if improved:
             best_val_loss = avg_val
             best_ckpt = output_dir / "checkpoint_best.pt"
             _save_checkpoint(
@@ -501,12 +532,13 @@ def train_forecast(
                 best_val_loss=best_val_loss,
                 klines_norm=train_ds.klines_norm, state_norm=train_ds.state_norm,
             )
-            print(f"  ✓ New best val_loss={best_val_loss:.4f}  → {best_ckpt.name}")
+            tqdm.write(f"    ✓ New best val_loss={best_val_loss:.4f}  → {best_ckpt.name}")
 
         # Accumulate val predictions for calibration
         all_val_logits.extend(epoch_val_logits)
         all_val_labels.extend(epoch_val_labels)
-        print()
+
+    epoch_bar.close()
 
     # ── 7. Meta-label + calibration + save ───────────────────────────────
     print("[7/7] Training meta-label classifier + calibration...")
@@ -569,7 +601,7 @@ def _train_meta_and_calibrate(
     # ── Meta-label classifier ──────────────────────────────────────────────
     if len(logits_np) > 10:
         probs      = torch.softmax(torch.from_numpy(logits_np), dim=-1).numpy()
-        BIN_CTR    = [-4.0, -2.5, -1.5, -0.75, -0.35, 0.0, 0.35, 0.75, 1.5, 2.5, 4.0]
+        BIN_CTR    = [-1.0, 1.0]  # binary: down, up
         import math
         fc_conf  = [1.0 - (-sum(p * math.log(p + 1e-12) for p in row) / math.log(11)) for row in probs]
         fc_move  = [sum(p * c for p, c in zip(row, BIN_CTR)) for row in probs]
@@ -591,7 +623,6 @@ def _train_meta_and_calibrate(
             "fc_confidence": fc_conf,
             "fc_expected_move_sigma": fc_move,
             "vol_regime_id": [0.0] * n,
-            "funding_rate": _col("funding_rate"),
             "rsi_14": _col("rsi_14"),
             "log_ret_60m": _col("log_ret_60m"),
             "realized_vol_30m": _col("realized_vol_30m"),
@@ -680,7 +711,7 @@ def _save_artefacts(
         "unfreeze_top_k": unfreeze_top_k,
         "kronos_hidden": kronos_hidden,
         "n_features": n_features,
-        "seq_klines": 256,
+        "seq_klines": 512,
         "seq_state": 128,
         "best_val_loss": round(best_val_loss, 4),
         "meta_label_metrics": meta_metrics,

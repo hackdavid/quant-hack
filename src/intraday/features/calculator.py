@@ -64,7 +64,6 @@ class MetricsUpdate:
     taker_ls_vol_ratio: float
     top_ls_count: float = 0.0
     top_ls_value: float = 0.0
-    funding_rate: float = 0.0
 
 
 @dataclass
@@ -140,9 +139,7 @@ class FeatureCalculator:
         self._bar_trade_count: int = 0
 
         # Depth
-        self._depth_prev: Optional[DepthBands] = None
         self._depth_latest: Optional[DepthBands] = None
-        self._ofi_accum: list[float] = []
 
         # Metrics
         self._metrics_latest: Optional[MetricsUpdate] = None
@@ -195,11 +192,6 @@ class FeatureCalculator:
         self._bar_trade_count += 1
 
     def _on_depth(self, d: DepthBands) -> None:
-        if self._depth_latest is not None:
-            db = d.bid_02pct - self._depth_latest.bid_02pct
-            da = d.ask_02pct - self._depth_latest.ask_02pct
-            self._ofi_accum.append(db - da)
-        self._depth_prev = self._depth_latest
         self._depth_latest = d
 
     def _on_metrics(self, m: MetricsUpdate) -> None:
@@ -215,7 +207,6 @@ class FeatureCalculator:
 
         row = self._build_row(bar)
         self._klines_5m.append(bar)
-        self._ofi_accum.clear()
         self._bar_trade_count = 0
 
         if row is None:
@@ -241,7 +232,7 @@ class FeatureCalculator:
         close = bar.close
 
         # ── Price features ────────────────────────────────────────────────
-        log_ret_1m  = _log_ret(closes_1m[-1], close)
+        log_ret_1m  = _log_ret(closes_1m[-2], closes_1m[-1]) if len(closes_1m) >= 2 else 0.0
         log_ret_5m  = _log_ret(closes_5m[-1], close) if closes_5m else 0.0
         log_ret_15m = _log_ret(closes_5m[-3],  close) if len(closes_5m) >= 3  else None
         log_ret_60m = _log_ret(closes_5m[-12], close) if len(closes_5m) >= 12 else None
@@ -265,18 +256,12 @@ class FeatureCalculator:
         avg_size  = vol_5m / tc if tc > 0 else 0.0
 
         # ── Depth features ────────────────────────────────────────────────
-        d_imb_02 = d_imb_1 = bid_02 = ask_02 = ofi = None
+        d_imb_1 = None
         if self._depth_latest is not None:
             d = self._depth_latest
-            b02, a02 = d.bid_02pct, d.ask_02pct
-            b1,  a1  = d.bid_1pct,  d.ask_1pct
-            if b02 + a02 > 0:
-                d_imb_02 = (b02 - a02) / (b02 + a02)
+            b1, a1 = d.bid_1pct, d.ask_1pct
             if b1 + a1 > 0:
                 d_imb_1 = (b1 - a1) / (b1 + a1)
-            bid_02, ask_02 = b02, a02
-        if self._ofi_accum:
-            ofi = sum(self._ofi_accum)
 
         # ── VPIN ──────────────────────────────────────────────────────────
         vpin_val   = self._vpin.vpin()
@@ -288,13 +273,12 @@ class FeatureCalculator:
         h_net  = self._hawkes.net
 
         # ── Market structure ──────────────────────────────────────────────
-        oi_btc = oi_chg = ls_r = taker_lr = fund = None
+        oi_btc = oi_chg = ls_r = taker_lr = None
         if self._metrics_latest is not None:
             m = self._metrics_latest
-            oi_btc  = m.oi_btc
-            ls_r    = m.ls_count_ratio
+            oi_btc   = m.oi_btc
+            ls_r     = m.ls_count_ratio
             taker_lr = m.taker_ls_vol_ratio
-            fund    = m.funding_rate
             if len(self._metrics_history) >= 12:
                 old = self._metrics_history[-12].oi_btc
                 if old > 0:
@@ -314,11 +298,7 @@ class FeatureCalculator:
             taker_buy_ratio_5m=tbr,
             trade_count_5m=tc,
             avg_trade_size_5m=avg_size,
-            depth_imbalance_02pct=d_imb_02,
             depth_imbalance_1pct=d_imb_1,
-            bid_depth_02pct=bid_02,
-            ask_depth_02pct=ask_02,
-            ofi_5m=ofi,
             vpin_50=vpin_val,
             vpin_bucket_imbalance=vpin_bkt,
             hawkes_buy_intensity=h_buy,
@@ -328,7 +308,6 @@ class FeatureCalculator:
             oi_change_1h=oi_chg,
             ls_count_ratio=ls_r,
             taker_ls_vol_ratio=taker_lr,
-            funding_rate=fund,
         )
 
     def _attach_targets(self) -> None:

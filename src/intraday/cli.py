@@ -20,6 +20,7 @@ from intraday.agents.cli import agents_app
 from intraday.aggregator.cli import aggregator_app
 from intraday.data.binance_bulk import BulkKind, download_bulk
 from intraday.forecast.cli import forecast_app
+from intraday.models.cli import ml_app
 from intraday.rl.cli import rl_app
 from intraday.sim.cli import backtest_app
 from intraday.utils.logging import setup_logging
@@ -33,6 +34,7 @@ app.add_typer(backtest_app, name="backtest")
 app.add_typer(forecast_app, name="forecast")
 app.add_typer(agents_app, name="agent")
 app.add_typer(aggregator_app, name="train")
+app.add_typer(ml_app, name="ml")
 app.add_typer(rl_app, name="rl")
 
 console = Console()
@@ -192,24 +194,44 @@ def features_compute(
     force: Annotated[bool, typer.Option(help="Recompute existing days")] = False,
     vpin_bucket: Annotated[float, typer.Option(help="VPIN bucket size in BTC")] = 100.0,
     vpin_window: Annotated[int,   typer.Option(help="VPIN rolling window (buckets)")] = 50,
+    workers: Annotated[int, typer.Option(help="Parallel workers (0 = sequential)")] = 0,
+    warmup_days: Annotated[int, typer.Option(help="Warmup days per chunk to initialize rolling state")] = 14,
 ) -> None:
     """Compute feature rows (price, volume, depth, VPIN, Hawkes) from raw Parquet.
 
-    Processes one day at a time — no OOM risk regardless of date range.
-    Rolling state (VPIN, Hawkes) carries across day boundaries.
+    By default uses all available CPU cores for parallel processing. Each worker
+    handles an independent date-range chunk with a warmup window to initialize
+    rolling state (VPIN, Hawkes, RSI).
 
     Output: data/features/{symbol}/YYYY-MM-DD.parquet (288 rows per day)
 
     Examples:
-        intraday features compute --start 2026-05-20 --end 2026-06-19
+        intraday features compute                          # auto-continue, all cores
+        intraday features compute --start 2020-09-10      # full history, all cores
+        intraday features compute --workers 0             # sequential (exact state)
     """
+    import os
     from intraday.features.pipeline import TransformationPipeline
 
-    start_date = date.fromisoformat(start) if start else date(2026, 5, 20)
-    end_date   = date.fromisoformat(end)   if end   else date.today()
+    if start:
+        start_date = date.fromisoformat(start)
+    else:
+        # Auto-detect: start from day after the last computed feature file
+        features_dir = data_dir / "features" / symbol
+        existing = sorted(features_dir.glob("*.parquet")) if features_dir.exists() else []
+        if existing:
+            from datetime import timedelta
+            start_date = date.fromisoformat(existing[-1].stem) + timedelta(days=1)
+        else:
+            start_date = date(2020, 9, 10)
+    end_date = date.fromisoformat(end) if end else date.today()
+
+    n_workers = workers if workers > 0 else os.cpu_count() or 1
+    mode = f"{n_workers} parallel workers (warmup={warmup_days}d)" if n_workers > 1 else "sequential"
 
     rprint(f"[yellow]Computing features for {symbol}[/yellow]")
     rprint(f"Range     : {start_date} → {end_date}")
+    rprint(f"Mode      : {mode}")
     rprint(f"VPIN      : bucket={vpin_bucket} BTC, window={vpin_window} buckets")
     rprint(f"Hawkes    : α=1.0, β=10.0/s, μ=6.0")
     rprint(f"Output    : {data_dir}/features/{symbol}/")
@@ -218,7 +240,13 @@ def features_compute(
         data_dir=data_dir, symbol=symbol,
         vpin_bucket_btc=vpin_bucket, vpin_window=vpin_window,
     )
-    total = pipeline.run(start_date, end_date, force=force)
+
+    if n_workers > 1:
+        total = pipeline.run_parallel(start_date, end_date, force=force,
+                                      workers=n_workers, warmup_days=warmup_days)
+    else:
+        total = pipeline.run(start_date, end_date, force=force)
+
     rprint(f"\n[green]✓[/green] {total:,} feature rows written")
 
 

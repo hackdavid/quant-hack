@@ -53,8 +53,9 @@ class _LoRALinear(nn.Module):
 
         fan_in  = linear.in_features
         fan_out = linear.out_features
-        self.lora_A = nn.Parameter(torch.empty(r, fan_in))
-        self.lora_B = nn.Parameter(torch.zeros(fan_out, r))
+        dev     = linear.weight.device
+        self.lora_A = nn.Parameter(torch.empty(r, fan_in, device=dev))
+        self.lora_B = nn.Parameter(torch.zeros(fan_out, r, device=dev))
         self.scale   = alpha / r
 
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))

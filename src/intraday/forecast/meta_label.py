@@ -22,7 +22,6 @@ META_FEATURE_COLS: list[str] = [
     "fc_confidence",
     "fc_expected_move_sigma",
     "vol_regime_id",
-    "funding_rate",
     "rsi_14",
     "log_ret_60m",
     "realized_vol_30m",

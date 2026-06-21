@@ -54,18 +54,20 @@ _DEPTH_BAND_COLS: dict[float, str] = {
 # CSV → Polars transforms (one per dataset kind)
 # ---------------------------------------------------------------------------
 
+_AGG_COLS = ["agg_trade_id", "price", "quantity", "first_trade_id", "last_trade_id", "transact_time", "is_buyer_maker"]
+_AGG_DTYPES = {"agg_trade_id": pl.Int64, "price": pl.Float64, "quantity": pl.Float64,
+               "first_trade_id": pl.Int64, "last_trade_id": pl.Int64,
+               "transact_time": pl.Int64, "is_buyer_maker": pl.Boolean}
+
+
 def _parse_aggTrades(raw: bytes) -> pl.DataFrame:
+    # Old files (pre-2022) have no header row; detect by checking first byte.
+    has_header = raw.lstrip()[:1].isalpha()
     df = pl.read_csv(
         raw,
-        schema_overrides={
-            "agg_trade_id": pl.Int64,
-            "price": pl.Float64,
-            "quantity": pl.Float64,
-            "first_trade_id": pl.Int64,
-            "last_trade_id": pl.Int64,
-            "transact_time": pl.Int64,
-            "is_buyer_maker": pl.Boolean,
-        },
+        has_header=has_header,
+        new_columns=None if has_header else _AGG_COLS,
+        schema_overrides=_AGG_DTYPES,
     )
     return (
         df.rename({"transact_time": "time_ms"})
@@ -74,23 +76,22 @@ def _parse_aggTrades(raw: bytes) -> pl.DataFrame:
     )
 
 
+_KLINE_COLS = ["open_time", "open", "high", "low", "close", "volume", "close_time",
+               "quote_volume", "count", "taker_buy_volume", "taker_buy_quote_volume", "ignore"]
+_KLINE_DTYPES = {"open_time": pl.Int64, "open": pl.Float64, "high": pl.Float64,
+                 "low": pl.Float64, "close": pl.Float64, "volume": pl.Float64,
+                 "close_time": pl.Int64, "quote_volume": pl.Float64, "count": pl.Int32,
+                 "taker_buy_volume": pl.Float64, "taker_buy_quote_volume": pl.Float64, "ignore": pl.Int32}
+
+
 def _parse_klines(raw: bytes) -> pl.DataFrame:
+    # Old files (pre-2022) have no header row; detect by checking first byte.
+    has_header = raw.lstrip()[:1].isalpha()
     df = pl.read_csv(
         raw,
-        schema_overrides={
-            "open_time": pl.Int64,
-            "open": pl.Float64,
-            "high": pl.Float64,
-            "low": pl.Float64,
-            "close": pl.Float64,
-            "volume": pl.Float64,
-            "close_time": pl.Int64,
-            "quote_volume": pl.Float64,
-            "count": pl.Int32,
-            "taker_buy_volume": pl.Float64,
-            "taker_buy_quote_volume": pl.Float64,
-            "ignore": pl.Int32,
-        },
+        has_header=has_header,
+        new_columns=None if has_header else _KLINE_COLS,
+        schema_overrides=_KLINE_DTYPES,
     )
     return (
         df.rename({"open_time": "open_time_ms", "close_time": "close_time_ms", "count": "trade_count"})

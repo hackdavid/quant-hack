@@ -27,7 +27,7 @@ log = structlog.get_logger(__name__)
 _KLINE_COLS     = ["open", "high", "low", "close", "volume"]
 _KLINE_RAW_COLS = ["open", "high", "low", "close", "volume", "quote_volume"]
 _STAMP_COLS     = ["minute", "hour", "weekday", "day", "month"]
-N_BINS = 11
+N_BINS = 2   # binary: 0=down, 1=up  (flat samples filtered at mask time)
 
 
 # ── Normalisation helper ───────────────────────────────────────────────────────
@@ -187,7 +187,7 @@ class ForecastDataset(Dataset):
             state_sl = np.concatenate([np.zeros((pad_s, state_sl.shape[1]), dtype=np.float32), state_sl])
 
         # ── labels ─────────────────────────────────────────────────────────
-        bin_label  = self._ret_to_bin(realized_ret)
+        bin_label  = self._sign_to_bin(label_sign)
         meta_y     = int(label_sign != 0 and int(np.sign(realized_ret)) == label_sign)
 
         return (
@@ -248,7 +248,12 @@ class ForecastDataset(Dataset):
 
     def _compute_valid_mask(self, label_ts: np.ndarray) -> np.ndarray:
         valid = np.ones(len(label_ts), dtype=bool)
+        label_signs = self._labels["label_sign"].to_numpy()
         for i, ts in enumerate(label_ts):
+            # Drop flat samples — binary classification only (down=0, up=1)
+            if label_signs[i] == 0:
+                valid[i] = False
+                continue
             k_pos = int(np.searchsorted(self._klines_ts, ts, side="right"))
             s_pos = int(np.searchsorted(self._state_ts,  ts, side="right"))
             if k_pos < self._seq_klines // 2:
@@ -258,12 +263,9 @@ class ForecastDataset(Dataset):
         return valid
 
     @staticmethod
-    def _ret_to_bin(ret_sigma: float) -> int:
-        edges = [-3.0, -2.0, -1.0, -0.5, -0.2, 0.2, 0.5, 1.0, 2.0, 3.0]
-        for b, edge in enumerate(edges):
-            if ret_sigma < edge:
-                return b
-        return 10
+    def _sign_to_bin(label_sign: int) -> int:
+        """Map label_sign {-1, +1} → bin {0=down, 1=up}."""
+        return 0 if label_sign < 0 else 1
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

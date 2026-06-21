@@ -9,15 +9,20 @@ Single entry point that:
      across day boundaries — no artificial resets at midnight
   5. Writes one feature Parquet per calendar day, sorted by bar_time_ms
 
+Parallel mode:
+  Splits the date range into N equal chunks, each with a configurable warmup
+  window so rolling state (VPIN, Hawkes) is properly initialized.
+  Each chunk runs in its own OS process — no shared memory, no locking.
+
 Output:
   data/features/BTCUSDT/2026-05-20.parquet  ← 288 rows (one per 5m bar)
   data/features/BTCUSDT/2026-05-21.parquet
   ...
-
-Iterate tick-by-tick (bar-by-bar) across days via LazyFeatureStore.
 """
 
-from datetime import date, timedelta
+import math
+from datetime import date, datetime, timedelta, timezone
+from multiprocessing import Pool
 from pathlib import Path
 from typing import Optional
 
@@ -31,7 +36,7 @@ from intraday.features.calculator import (
     KlineBar,
     MetricsUpdate,
 )
-from intraday.features.schema import FeatureRow
+from intraday.features.schema import FEATURE_ROW_SCHEMA, FeatureRow
 from intraday.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -138,18 +143,100 @@ def _load_events(raw_base: Path, symbol: str, day: date) -> list[tuple[int, str,
     return events
 
 
+def _process_day(
+    day: date,
+    calc: FeatureCalculator,
+    raw_base: Path,
+    features_dir: Path,
+    symbol: str,
+    force: bool,
+) -> int:
+    """Process one day: feed events into calc, write parquet. Returns rows written."""
+    out_path = features_dir / f"{day.isoformat()}.parquet"
+    if out_path.exists() and not force:
+        return 0
+
+    events = _load_events(raw_base, symbol, day)
+    if not events:
+        return 0
+
+    rows: list[FeatureRow] = []
+    for _, _kind, event in events:
+        result = calc.dispatch(event)
+        if result is not None:
+            rows.append(result)
+
+    rows.extend(calc.flush())
+    if not rows:
+        return 0
+
+    day_start_ms = int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp() * 1000)
+    day_end_ms = day_start_ms + _MS_PER_DAY
+    rows_today = [r for r in rows if day_start_ms <= r.bar_time_ms < day_end_ms]
+    if not rows_today:
+        return 0
+
+    df = pl.DataFrame([r.model_dump() for r in rows_today], schema=FEATURE_ROW_SCHEMA).sort("bar_time_ms")
+    df.write_parquet(out_path, compression="zstd")
+    return len(rows_today)
+
+
+# ---------------------------------------------------------------------------
+# Module-level worker — must be at top level to be picklable by multiprocessing
+# ---------------------------------------------------------------------------
+
+def _chunk_worker(args: tuple) -> tuple[int, int]:
+    """Process one date-range chunk. Returns (chunk_id, total_rows_written).
+
+    Steps:
+      1. Warmup phase: replay `warmup_days` days before the chunk start to
+         initialize rolling state (VPIN buckets, Hawkes, price windows).
+         No files are written during warmup.
+      2. Production phase: process chunk_start..chunk_end and write parquet.
+    """
+    (
+        chunk_id,
+        data_dir_str, symbol,
+        warmup_start_iso, chunk_start_iso, chunk_end_iso,
+        calc_kwargs, force,
+    ) = args
+
+    data_dir = Path(data_dir_str)
+    raw_base = data_dir / "raw" / "binance"
+    features_dir = data_dir / "features" / symbol
+    features_dir.mkdir(parents=True, exist_ok=True)
+
+    warmup_start = date.fromisoformat(warmup_start_iso)
+    chunk_start  = date.fromisoformat(chunk_start_iso)
+    chunk_end    = date.fromisoformat(chunk_end_iso)
+
+    calc = FeatureCalculator(**calc_kwargs)
+
+    # ── Warmup: feed events, discard output ──────────────────────────────
+    day = warmup_start
+    while day < chunk_start:
+        events = _load_events(raw_base, symbol, day)
+        for _, _kind, event in events:
+            calc.dispatch(event)
+        day += timedelta(days=1)
+
+    # ── Production: write feature parquet files ───────────────────────────
+    total = 0
+    day = chunk_start
+    while day <= chunk_end:
+        written = _process_day(day, calc, raw_base, features_dir, symbol, force)
+        total += written
+        day += timedelta(days=1)
+
+    return chunk_id, total
+
+
 # ---------------------------------------------------------------------------
 # TransformationPipeline
 # ---------------------------------------------------------------------------
 
 class TransformationPipeline:
-    """End-to-end pipeline: raw Parquet → feature Parquet.
-
-    Example:
-        pipeline = TransformationPipeline(Path("data"))
-        total = pipeline.run(date(2026, 5, 20), date(2026, 6, 19))
-        print(f"{total} feature rows written")
-    """
+    """End-to-end pipeline: raw Parquet → feature Parquet."""
 
     def __init__(
         self,
@@ -161,10 +248,10 @@ class TransformationPipeline:
         hawkes_beta: float = 10.0,
         hawkes_mu: float = 6.0,
     ) -> None:
-        self.data_dir    = Path(data_dir)
-        self.raw_base    = self.data_dir / "raw" / "binance"
+        self.data_dir     = Path(data_dir)
+        self.raw_base     = self.data_dir / "raw" / "binance"
         self.features_dir = self.data_dir / "features" / symbol
-        self.symbol      = symbol
+        self.symbol       = symbol
         self._calc_kwargs = dict(
             symbol=symbol,
             vpin_bucket_btc=vpin_bucket_btc,
@@ -174,78 +261,84 @@ class TransformationPipeline:
             hawkes_mu=hawkes_mu,
         )
 
+    # ── Sequential run ────────────────────────────────────────────────────
+
     def run(
         self,
         start_date: date,
         end_date: date,
         force: bool = False,
     ) -> int:
-        """Process all days in chronological order. Returns total rows written.
-
-        Rolling state (VPIN, Hawkes, price windows) carries across day boundaries.
-        """
+        """Process all days sequentially. Rolling state is exact — no warmup gap."""
         self.features_dir.mkdir(parents=True, exist_ok=True)
         calc = FeatureCalculator(**self._calc_kwargs)
         total = 0
         day = start_date
-
         while day <= end_date:
-            rows_written = self._run_day(day, calc, force)
-            total += rows_written
+            written = _process_day(day, calc, self.raw_base, self.features_dir, self.symbol, force)
+            total += written
             day += timedelta(days=1)
 
-        logger.info(
-            "pipeline.complete",
-            start=start_date.isoformat(),
-            end=end_date.isoformat(),
-            total_rows=total,
-        )
+        logger.info("pipeline.complete",
+                    start=start_date.isoformat(), end=end_date.isoformat(), total_rows=total)
         return total
 
-    def _run_day(self, day: date, calc: FeatureCalculator, force: bool) -> int:
-        out_path = self.features_dir / f"{day.isoformat()}.parquet"
-        if out_path.exists() and not force:
-            logger.debug("pipeline.skip", day=day.isoformat())
-            return 0
+    # ── Parallel run ──────────────────────────────────────────────────────
 
-        events = _load_events(self.raw_base, self.symbol, day)
-        if not events:
-            logger.warning("pipeline.no_data", day=day.isoformat())
-            return 0
+    def run_parallel(
+        self,
+        start_date: date,
+        end_date: date,
+        force: bool = False,
+        workers: int = 8,
+        warmup_days: int = 14,
+    ) -> int:
+        """Split date range into `workers` chunks and process in parallel.
 
-        rows: list[FeatureRow] = []
-        for _, kind, event in events:
-            result = calc.dispatch(event)
-            if result is not None:
-                rows.append(result)
+        Each chunk warms up `warmup_days` before its start so rolling state
+        (VPIN, Hawkes, RSI) is properly initialized. Rolling state within each
+        chunk is fully correct; the only approximation is the very first few bars
+        of each chunk boundary (resolved by warmup).
 
-        # Flush remaining rows that have enough future data
-        rows.extend(calc.flush())
+        Note: GPU (A100) is not used here — Hawkes/VPIN are sequential state
+        machines that don't benefit from GPU tensor ops. All 16 CPU cores are
+        used instead for ~16x wall-clock speedup.
+        """
+        self.features_dir.mkdir(parents=True, exist_ok=True)
 
-        if not rows:
-            logger.warning("pipeline.no_rows", day=day.isoformat())
-            return 0
+        total_days = (end_date - start_date).days + 1
+        actual_workers = min(workers, total_days)
+        chunk_size = math.ceil(total_days / actual_workers)
 
-        # Keep only rows belonging to this calendar day
-        day_start_ms = int(day.strftime("%s")) * 1000  # midnight UTC
-        # Safer: compute from date parts
-        from datetime import datetime, timezone
-        day_start_ms = int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp() * 1000)
-        day_end_ms   = day_start_ms + _MS_PER_DAY
+        job_args = []
+        for i in range(actual_workers):
+            chunk_start = start_date + timedelta(days=i * chunk_size)
+            if chunk_start > end_date:
+                break
+            chunk_end = min(start_date + timedelta(days=(i + 1) * chunk_size - 1), end_date)
+            # Clamp warmup so it never goes before the very first available date
+            warmup_start = max(start_date, chunk_start - timedelta(days=warmup_days))
 
-        rows_today = [r for r in rows if day_start_ms <= r.bar_time_ms < day_end_ms]
-
-        if not rows_today:
-            logger.debug("pipeline.all_rows_spillover", day=day.isoformat(), total=len(rows))
-            return 0
-
-        df = pl.DataFrame([r.model_dump() for r in rows_today]).sort("bar_time_ms")
-        df.write_parquet(out_path, compression="zstd")
+            job_args.append((
+                i,
+                str(self.data_dir), self.symbol,
+                warmup_start.isoformat(), chunk_start.isoformat(), chunk_end.isoformat(),
+                self._calc_kwargs, force,
+            ))
 
         logger.info(
-            "pipeline.day_done",
-            day=day.isoformat(),
-            rows=len(rows_today),
-            size_kb=round(out_path.stat().st_size / 1024, 1),
+            "pipeline.parallel_start",
+            workers=len(job_args),
+            warmup_days=warmup_days,
+            total_days=total_days,
+            chunk_size=chunk_size,
         )
-        return len(rows_today)
+
+        with Pool(processes=len(job_args)) as pool:
+            results = pool.map(_chunk_worker, job_args)
+
+        total = sum(rows for _, rows in results)
+        logger.info("pipeline.parallel_complete",
+                    workers=len(job_args), total_rows=total,
+                    start=start_date.isoformat(), end=end_date.isoformat())
+        return total

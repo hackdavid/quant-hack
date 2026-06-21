@@ -25,7 +25,7 @@ from intraday.features.calculator import (
     KlineBar,
     MetricsUpdate,
 )
-from intraday.features.schema import FeatureRow
+from intraday.features.schema import FEATURE_ROW_SCHEMA, FeatureRow
 from intraday.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -183,7 +183,7 @@ def process_day(
 
     # Write to Parquet
     records = [r.model_dump() for r in rows]
-    df = pl.DataFrame(records)
+    df = pl.DataFrame(records, schema=FEATURE_ROW_SCHEMA)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(out_path, compression="zstd")
 
