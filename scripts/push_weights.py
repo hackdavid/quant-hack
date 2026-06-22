@@ -18,8 +18,8 @@ from huggingface_hub.utils import HfHubHTTPError
 
 REPO_ID     = "ibrahimdaud/binance-btcusdt"
 REPO_TYPE   = "dataset"
-RUN_DIR     = Path("models/forecast/20260621T173906Z")
-DEST_PREFIX = "models/forecast/run_v1"
+RUN_DIR     = Path("models/forecast/20260621T212013Z")
+DEST_PREFIX = "models/forecast/run_v3"
 
 
 def main() -> None:
@@ -58,7 +58,7 @@ def main() -> None:
         folder_path=str(RUN_DIR),
         path_in_repo=DEST_PREFIX,
         token=token,
-        commit_message="Add Kronos LoRA forecast model weights (run_v1, 10 epochs, val_loss=0.2896)",
+        commit_message="Add Kronos LoRA forecast weights (run_v3, 7 epochs, binary labels, seq=512, rank=32)",
     )
 
     print(f"\nDone — https://huggingface.co/datasets/{REPO_ID}/tree/main/{DEST_PREFIX}")
