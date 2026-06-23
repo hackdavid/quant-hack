@@ -182,40 +182,11 @@ class BinanceFeed:
             "trade_count": [c.trade_count for c in candles],
         })
 
-    def load_historical(self, data_dir: Path, limit: int = 128) -> int:
-        """Load historical bars from local parquet or Binance API."""
-        # Try local parquet first
-        features_dir = data_dir / "features" / self.symbol.upper()
-        if features_dir.exists():
-            files = sorted(features_dir.glob("*.parquet"))
-            if files:
-                try:
-                    df = pl.read_parquet(files[-1]).sort("bar_time_ms")
-                    if len(df) >= limit:
-                        df = df.tail(limit)
-                    loaded = 0
-                    for row in df.iter_rows(named=True):
-                        candle = Candle(
-                            ts_ms=int(row["bar_time_ms"]),
-                            open=float(row.get("close", row.get("open", 0.0))),
-                            high=float(row.get("high", row.get("close", 0.0))),
-                            low=float(row.get("low", row.get("close", 0.0))),
-                            close=float(row["close"]),
-                            volume=float(row.get("vol_5m", 0.0)),
-                            quote_volume=float(row.get("vol_5m", 0.0)),
-                            taker_buy_vol=float(row.get("taker_buy_ratio_5m", 0.0)),
-                            trade_count=int(row.get("trade_count_5m", 0)),
-                        )
-                        self._buffer.append(candle)
-                        self._last_close = candle.close
-                        loaded += 1
-                    log.info("historical_loaded_parquet", bars=loaded, file=str(files[-1]))
-                    return loaded
-                except Exception as exc:
-                    log.warning("parquet_load_failed", error=str(exc))
-
-        # Fallback to Binance API
-        url = "https://fapi.binance.com/fapi/v1/klines"
+    def load_historical(self, limit: int = 128) -> int:
+        """Load historical bars from Binance Vision API (public data, no auth needed).
+        Uses data-api.binance.vision which is accessible from all regions.
+        """
+        url = "https://data-api.binance.vision/api/v3/klines"
         params = {
             "symbol": self.symbol.upper(),
             "interval": self.interval,
@@ -242,7 +213,7 @@ class BinanceFeed:
                 self._buffer.append(candle)
                 self._last_close = candle.close
                 loaded += 1
-            log.info("historical_loaded_api", bars=loaded, symbol=self.symbol)
+            log.info("historical_loaded_vision", bars=loaded, symbol=self.symbol)
             return loaded
         except Exception as exc:
             log.error("historical_load_failed", error=str(exc))
@@ -451,7 +422,7 @@ class AutonomousTrader:
 
         self._running = True
         # Load historical bars first so we don't wait 10 hours
-        loaded = self.feed.load_historical(data_dir=self.data_dir, limit=128)
+        loaded = self.feed.load_historical(limit=128)
         rprint(f"[green]Loaded {loaded} historical bars[/green]")
         self._task = asyncio.create_task(self.feed.run())
         if loaded >= 128:
