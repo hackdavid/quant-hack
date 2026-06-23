@@ -5,7 +5,7 @@ Pipeline:
   2. Build ForecastDataset (purged train/val split)
   3. Load Kronos (frozen or with LoRA on top-K layers) + KronosTokenizer
   4. Train SmallTCN + ForecastHead (+ optional LoRA params) with:
-       - CrossEntropyLoss (label_smoothing=0.05)
+       - CrossEntropyLoss (label_smoothing=0.0)
        - AdamW with separate LR groups for LoRA vs TCN/head
        - Linear warmup → cosine decay LR schedule
        - Gradient accumulation for large effective batch sizes
@@ -263,8 +263,10 @@ def train_forecast(
 
     n_features   = len(ALL_FEATURES)
     pin          = dev.type == "cuda"
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=0, pin_memory=pin)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=pin)
+    import os
+    n_workers    = min(8, os.cpu_count() or 1)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=n_workers, pin_memory=pin, persistent_workers=n_workers>0, prefetch_factor=2 if n_workers>0 else None)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=n_workers, pin_memory=pin, persistent_workers=n_workers>0, prefetch_factor=2 if n_workers>0 else None)
 
     # ── 3. Load Kronos (frozen or LoRA on top-k layers) ───────────────────
     mode_label = f"LoRA top-{unfreeze_top_k} layers" if unfreeze_top_k > 0 else "fully frozen"
@@ -603,9 +605,14 @@ def _train_meta_and_calibrate(
         probs      = torch.softmax(torch.from_numpy(logits_np), dim=-1).numpy()
         BIN_CTR    = [-1.0, 1.0]  # binary: down, up
         import math
-        fc_conf  = [1.0 - (-sum(p * math.log(p + 1e-12) for p in row) / math.log(11)) for row in probs]
-        fc_move  = [sum(p * c for p, c in zip(row, BIN_CTR)) for row in probs]
-        n        = len(fc_conf)
+        fc_conf_all = [1.0 - (-sum(p * math.log(p + 1e-12) for p in row) / math.log(11)) for row in probs]
+        fc_move_all = [sum(p * c for p, c in zip(row, BIN_CTR)) for row in probs]
+        # all_val_logits accumulates across epochs; cap to val_labels_df rows using last epoch
+        n_df     = len(val_labels_df)
+        n        = min(len(fc_conf_all), n_df)
+        fc_conf  = fc_conf_all[-n:]
+        fc_move  = fc_move_all[-n:]
+        labels_meta = labels_np[-n:]
 
         def _col(name: str, default: float = 0.0) -> list[float]:
             if name in val_labels_df.columns:
@@ -628,7 +635,7 @@ def _train_meta_and_calibrate(
             "realized_vol_30m": _col("realized_vol_30m"),
             "hour_utc": hour_utc,
         })
-        meta_y  = pl.Series("y", labels_np[:n].astype(np.int32))
+        meta_y  = pl.Series("y", labels_meta.astype(np.int32))
         ts_ser  = pl.Series("ts", val_labels_df["bar_time_ms"].head(n))
         try:
             meta_clf = MetaLabelClassifier()
