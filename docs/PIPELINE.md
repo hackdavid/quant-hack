@@ -569,6 +569,67 @@ All files required to run inference on a fresh clone are in this repo:
 
 ---
 
+## 10. MetaTrader 5 Execution (Alternative Venue)
+
+If your capital is on an MT5 broker, you can use the MT5 wrapper as the execution layer while keeping the Binance WebSocket as the data layer.
+
+### ⚠️ Important caveats
+
+| Issue | Mitigation |
+|-------|-----------|
+| **Instrument mismatch** | MT5 offers BTC *CFDs*, not Binance perps. Prices diverge slightly. | **Only use for 4h+ horizons** |
+| **Latency** | MT5 terminal → broker → market maker. 200ms–2s. | Accept higher slippage |
+| **No WebSocket** | We poll `symbol_info_tick()` every 100ms. | Use `mt5.stream_ticks()` |
+| **Missing features** | No funding_rate, OI, LS ratio from MT5. | Use Binance data for model input |
+
+### Symbol mapping
+
+| Binance | MT5 |
+|---------|-----|
+| BTCUSDT | BTCUSD |
+| ETHUSDT | ETHUSD |
+| XRPUSDT | XRPUSD |
+| SOLUSDT | SOLUSD |
+
+### Usage
+
+```python
+from intraday.trader.mt5_wrapper import MT5TradingWrapper
+
+mt5 = MT5TradingWrapper(account_id=123456, password="...", server="XMGlobal-MT5")
+mt5.connect()
+
+# Place market order
+result = mt5.market_order("BTCUSDT", "buy", volume=0.01)
+
+# Get positions
+for p in mt5.get_positions("BTCUSDT"):
+    print(p.side, p.volume, p.profit)
+
+# Close all
+mt5.close_all_positions("BTCUSDT")
+
+# Stream ticks to your AI
+async def on_tick(payload):
+    print(payload["bid"], payload["ask"])
+
+await mt5.stream_ticks(["BTCUSDT"], callback=on_tick)
+
+mt5.shutdown()
+```
+
+### Smoke test
+
+```bash
+python scripts/test_mt5.py \
+    --account 123456 \
+    --password "..." \
+    --server "XMGlobal-MT5" \
+    --symbol BTCUSDT
+```
+
+---
+
 ## 9. Quick Reference
 
 ### Command cheat sheet

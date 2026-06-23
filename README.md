@@ -494,6 +494,22 @@ uv run python scripts/run_live_trade.py \
     --leverage 1
 ```
 
+### MetaTrader 5 execution (alternative venue)
+If your capital is on an MT5 broker, use the MT5 wrapper as the execution layer while keeping Binance data for the model:
+
+```bash
+# Smoke test
+python scripts/test_mt5.py --account 123456 --password "..." --server "XMGlobal-MT5"
+
+# In your trading loop
+from intraday.trader.mt5_wrapper import MT5TradingWrapper
+mt5 = MT5TradingWrapper(account_id=123456, password="...", server="XMGlobal-MT5")
+mt5.connect()
+mt5.market_order("BTCUSDT", "buy", volume=0.01)
+```
+
+See `docs/PIPELINE.md` §10 for MT5 caveats and symbol mapping.
+
 ### Risk defaults
 | Parameter | Default | Description |
 |-----------|---------|-------------|
