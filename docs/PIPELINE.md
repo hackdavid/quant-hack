@@ -660,23 +660,44 @@ TradeLogger (JSONL logs with full pipeline context)
 
 ### Setup
 
+> **⚠️ Windows is required for live trading.** The `MetaTrader5` Python package and the MT5 terminal are Windows-only. The Linux mock mode is for development and testing only.
+
+**Step 1: Test MT5 on Windows**
+
 ```bash
-# 1. Set LLM credentials
+# On Windows — verify MT5 connection before running the full loop
+pip install MetaTrader5 polars numpy httpx websockets typer structlog rich
+python scripts/test_mt5.py \
+    --account 10408 --password "Daudibrahim@123" --server "3.11.134.149:443" \
+    --symbol BTCUSDT
+```
+
+**Step 2: Run live on Windows (real orders)**
+
+```bash
+# Windows
+set LLM_TOKEN=fw_...
+set LLM_BASE_URL=https://api.fireworks.ai/inference
+set LLM_MODEL=accounts/fireworks/routers/kimi-k2p6-turbo
+
+python scripts/autonomous_trader.py \
+    --transformer-run models/transformer/20260623T132957Z \
+    --mt5-account 10408 --mt5-password "Daudibrahim@123" --mt5-server "3.11.134.149:443" \
+    --use-llm --interval 5
+```
+
+**Step 3: Linux mock mode (development only)**
+
+```bash
+# Linux — simulated orders, no real trades
 export LLM_TOKEN="fw_..."
 export LLM_BASE_URL="https://api.fireworks.ai/inference"
 export LLM_MODEL="accounts/fireworks/routers/kimi-k2p6-turbo"
 
-# 2. Run mock mode (Linux, no real orders)
 uv run python scripts/autonomous_trader.py \
     --transformer-run models/transformer/20260623T132957Z \
     --mt5-account 10408 --mt5-password "..." --mt5-server "..." \
     --mock-execution --use-llm --interval 5
-
-# 3. Run live (Windows, real MT5 orders)
-uv run python scripts/autonomous_trader.py \
-    --transformer-run models/transformer/20260623T132957Z \
-    --mt5-account 10408 --mt5-password "..." --mt5-server "..." \
-    --use-llm --interval 5
 ```
 
 ### LLM prompt contents

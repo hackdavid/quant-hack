@@ -510,30 +510,53 @@ mt5.market_order("BTCUSDT", "buy", volume=0.01)
 
 ### Autonomous Trading (Full Pipeline + LLM + MT5)
 
-End-to-end autonomous trading loop with V6 pipeline + LLM risk review + MT5 execution:
+> **⚠️ Windows Required for Live Trading**
+> 
+> The MetaTrader5 Python library and the MT5 terminal are **Windows-only**. The Linux mock mode below is for development and testing only. **You must move to a Windows machine or Windows VPS to execute real orders.**
+
+**Step 1: Windows setup (required before live trading)**
 
 ```bash
-# 1. Set your Fireworks LLM token
-export LLM_TOKEN="fw_..."
-export LLM_BASE_URL="https://api.fireworks.ai/inference"
-export LLM_MODEL="accounts/fireworks/routers/kimi-k2p6-turbo"
+# On Windows, install dependencies
+pip install MetaTrader5 polars numpy httpx websockets typer structlog rich
 
-# 2. Run in mock mode (Linux, no real orders)
-uv run python scripts/autonomous_trader.py \
+# Test MT5 connection
+python scripts/test_mt5.py \
+    --account 10408 \
+    --password "Daudibrahim@123" \
+    --server "3.11.134.149:443" \
+    --symbol BTCUSDT
+```
+
+**Step 2: Run the autonomous trader (Windows)**
+
+```bash
+# Set your Fireworks LLM token
+set LLM_TOKEN=fw_...
+set LLM_BASE_URL=https://api.fireworks.ai/inference
+set LLM_MODEL=accounts/fireworks/routers/kimi-k2p6-turbo
+
+# Run live (Windows — real MT5 orders)
+python scripts/autonomous_trader.py \
     --transformer-run models/transformer/20260623T132957Z \
     --mt5-account 10408 \
-    --mt5-password "..." \
-    --mt5-server "..." \
-    --mock-execution \
+    --mt5-password "Daudibrahim@123" \
+    --mt5-server "3.11.134.149:443" \
     --use-llm \
     --interval 5
+```
 
-# 3. Run live (Windows, real MT5 orders)
+**Step 3: Linux mock mode (development only)**
+
+```bash
+# Linux — simulated orders, no real trades
+export LLM_TOKEN="fw_..."
 uv run python scripts/autonomous_trader.py \
     --transformer-run models/transformer/20260623T132957Z \
     --mt5-account 10408 \
-    --mt5-password "..." \
-    --mt5-server "..." \
+    --mt5-password "Daudibrahim@123" \
+    --mt5-server "3.11.134.149:443" \
+    --mock-execution \
     --use-llm \
     --interval 5
 ```
