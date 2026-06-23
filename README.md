@@ -523,8 +523,8 @@ pip install MetaTrader5 polars numpy httpx websockets typer structlog rich
 # Test MT5 connection
 python scripts/test_mt5.py \
     --account 10408 \
-    --password "Daudibrahim@123" \
-    --server "3.11.134.149:443" \
+    --password "" \
+    --server "" \
     --symbol BTCUSDT
 ```
 
@@ -540,8 +540,8 @@ set LLM_MODEL=accounts/fireworks/routers/kimi-k2p6-turbo
 python scripts/autonomous_trader.py \
     --transformer-run models/transformer/20260623T132957Z \
     --mt5-account 10408 \
-    --mt5-password "Daudibrahim@123" \
-    --mt5-server "3.11.134.149:443" \
+    --mt5-password "" \
+    --mt5-server "" \
     --use-llm \
     --interval 5
 ```
@@ -554,8 +554,8 @@ export LLM_TOKEN="fw_..."
 uv run python scripts/autonomous_trader.py \
     --transformer-run models/transformer/20260623T132957Z \
     --mt5-account 10408 \
-    --mt5-password "Daudibrahim@123" \
-    --mt5-server "3.11.134.149:443" \
+    --mt5-password "" \
+    --mt5-server "" \
     --mock-execution \
     --use-llm \
     --interval 5
