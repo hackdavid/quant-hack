@@ -46,6 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 import numpy as np
 import polars as pl
 import structlog
@@ -180,6 +181,72 @@ class BinanceFeed:
             "taker_buy_vol": [c.taker_buy_vol for c in candles],
             "trade_count": [c.trade_count for c in candles],
         })
+
+    def load_historical(self, data_dir: Path, limit: int = 128) -> int:
+        """Load historical bars from local parquet or Binance API."""
+        # Try local parquet first
+        features_dir = data_dir / "features" / self.symbol.upper()
+        if features_dir.exists():
+            files = sorted(features_dir.glob("*.parquet"))
+            if files:
+                try:
+                    df = pl.read_parquet(files[-1]).sort("bar_time_ms")
+                    if len(df) >= limit:
+                        df = df.tail(limit)
+                    loaded = 0
+                    for row in df.iter_rows(named=True):
+                        candle = Candle(
+                            ts_ms=int(row["bar_time_ms"]),
+                            open=float(row.get("close", row.get("open", 0.0))),
+                            high=float(row.get("high", row.get("close", 0.0))),
+                            low=float(row.get("low", row.get("close", 0.0))),
+                            close=float(row["close"]),
+                            volume=float(row.get("vol_5m", 0.0)),
+                            quote_volume=float(row.get("vol_5m", 0.0)),
+                            taker_buy_vol=float(row.get("taker_buy_ratio_5m", 0.0)),
+                            trade_count=int(row.get("trade_count_5m", 0)),
+                        )
+                        self._buffer.append(candle)
+                        self._last_close = candle.close
+                        loaded += 1
+                    log.info("historical_loaded_parquet", bars=loaded, file=str(files[-1]))
+                    return loaded
+                except Exception as exc:
+                    log.warning("parquet_load_failed", error=str(exc))
+
+        # Fallback to Binance API
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        params = {
+            "symbol": self.symbol.upper(),
+            "interval": self.interval,
+            "limit": limit,
+        }
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; Bot/1.0)"}
+            resp = httpx.get(url, params=params, timeout=30.0, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            loaded = 0
+            for row in data:
+                candle = Candle(
+                    ts_ms=int(row[0]),
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[5]),
+                    quote_volume=float(row[7]),
+                    taker_buy_vol=float(row[9]),
+                    trade_count=int(row[8]),
+                )
+                self._buffer.append(candle)
+                self._last_close = candle.close
+                loaded += 1
+            log.info("historical_loaded_api", bars=loaded, symbol=self.symbol)
+            return loaded
+        except Exception as exc:
+            log.error("historical_load_failed", error=str(exc))
+            return 0
 
     async def run(self) -> None:
         stream = f"{self.symbol}@kline_{self.interval}"
@@ -347,6 +414,7 @@ class AutonomousTrader:
     ) -> None:
         self.symbol = symbol
         self.capital = capital
+        self.data_dir = data_dir
         self.feed = BinanceFeed(symbol=symbol)
         self.executor = MT5Executor(account=mt5_account, password=mt5_password, server=mt5_server, mock=mock_execution)
         self.llm = LLMReviewAgent(
@@ -382,8 +450,12 @@ class AutonomousTrader:
             return
 
         self._running = True
+        # Load historical bars first so we don't wait 10 hours
+        loaded = self.feed.load_historical(data_dir=self.data_dir, limit=128)
+        rprint(f"[green]Loaded {loaded} historical bars[/green]")
         self._task = asyncio.create_task(self.feed.run())
-        rprint("[yellow]Waiting for 128 bars to warm up...[/yellow]")
+        if loaded >= 128:
+            rprint("[green]Ready to trade immediately — no warm-up needed[/green]")
 
         while self._running:
             await asyncio.sleep(self.interval * 60)
