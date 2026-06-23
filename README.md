@@ -508,6 +508,59 @@ mt5.connect()
 mt5.market_order("BTCUSDT", "buy", volume=0.01)
 ```
 
+### Autonomous Trading (Full Pipeline + LLM + MT5)
+
+End-to-end autonomous trading loop with V6 pipeline + LLM risk review + MT5 execution:
+
+```bash
+# 1. Set your Fireworks LLM token
+export LLM_TOKEN="fw_..."
+export LLM_BASE_URL="https://api.fireworks.ai/inference"
+export LLM_MODEL="accounts/fireworks/routers/kimi-k2p6-turbo"
+
+# 2. Run in mock mode (Linux, no real orders)
+uv run python scripts/autonomous_trader.py \
+    --transformer-run models/transformer/20260623T132957Z \
+    --mt5-account 10408 \
+    --mt5-password "..." \
+    --mt5-server "..." \
+    --mock-execution \
+    --use-llm \
+    --interval 5
+
+# 3. Run live (Windows, real MT5 orders)
+uv run python scripts/autonomous_trader.py \
+    --transformer-run models/transformer/20260623T132957Z \
+    --mt5-account 10408 \
+    --mt5-password "..." \
+    --mt5-server "..." \
+    --use-llm \
+    --interval 5
+```
+
+**What it does:**
+1. Fetches 128 historical bars from Binance Vision API at startup
+2. Connects to Binance WebSocket for live 5-min bars
+3. Runs the full V6 pipeline (forecast → orderflow → regime → risk → stay_out → meta-learner → decision)
+4. Sends the full pipeline output + candle data to the LLM (Kimi K2.6 via Fireworks)
+5. LLM returns a fixed JSON schema: `{action, confidence, reason, position_size, sl_price, tp_price, risk_approved}`
+6. Risk manager validates the decision against competition rules
+7. MT5 executor places the order (or simulates in mock mode)
+8. TradeLogger records everything to `logs/autonomous_trader/trade_log_YYYY-MM-DD.jsonl`
+
+**Logs:**
+```bash
+# View last 50 trades
+python -c "
+from pathlib import Path
+import json
+p = sorted(Path('logs/autonomous_trader').glob('*.jsonl'))[-1]
+for line in list(open(p))[-50:]:
+    d = json.loads(line)
+    print(f\"{d['ts']} | {d['action']:>4} | conf={d['confidence']:.2f} | {d['reason'][:50]}\")
+"
+```
+
 See `docs/PIPELINE.md` §10 for MT5 caveats and symbol mapping.
 
 ### Risk defaults
@@ -529,24 +582,46 @@ quant-hack/
 │   ├── forecast/
 │   │   ├── transformer_model.py     CryptoTransformer (6.4M params)
 │   │   ├── train_transformer.py     Training loop with early stopping + checkpoints
-│   │   ├── train.py                 Original Kronos training loop
-│   │   └── ...
+│   │   └── train.py                 Original Kronos training loop
+│   ├── agents/
+│   │   ├── forecast.py              Transformer agent (AgentOpinion)
+│   │   ├── orderflow.py             Rule-based orderflow agent
+│   │   ├── regime.py                HMM + LightGBM regime detection
+│   │   ├── risk.py                  Rule-based risk gate
+│   │   └── stay_out.py              Rule-based stay-out filter
+│   ├── aggregator/
+│   │   ├── decision.py              DecisionEngine (5-gate logic)
+│   │   ├── features.py              build_aggregator_row() + schema
+│   │   └── meta_learner.py         LightGBM ensemble (4-fold)
+│   ├── llm/
+│   │   └── review.py                LLMReviewAgent (Fireworks/OpenAI)
 │   ├── backtest/
 │   │   └── engine.py                Vectorized backtest (fees, funding, slippage)
-│   ├── signal/
-│   │   └── combiner.py              Loads transformer + LGB, blends by val AUC
-│   ├── risk/
-│   │   └── agent.py                 Kelly sizing, daily loss limit, max drawdown halt
-│   └── trader/
-│       ├── exchange.py              Binance wrapper (paper + live via ccxt)
-│       └── loop.py                  Async WebSocket trading loop
+│   ├── trader/
+│   │   ├── exchange.py              Binance wrapper (paper + live via ccxt)
+│   │   ├── mt5_wrapper.py           MT5 trading wrapper (Windows/Linux)
+│   │   └── loop.py                  Async WebSocket trading loop
+│   └── rl/
+│       └── train.py                 CQL offline RL training
 ├── scripts/
 │   ├── train_lgb.py                 LightGBM baseline training
 │   ├── train_gbm_ensemble.py        GBDT + DART + XGBoost ensemble
 │   ├── run_backtest.py              Backtesting with threshold sweep
 │   ├── run_paper_trade.py           Paper trading (live WS, no orders)
 │   ├── run_live_trade.py            Live trading (real Binance futures)
+│   ├── autonomous_trader.py         Full autonomous loop (pipeline + LLM + MT5)
+│   ├── test_llm_review.py         LLM smoke test
+│   ├── test_mt5.py                 MT5 smoke test
+│   ├── run_pipeline_json.py         Pipeline JSON output with English explanations
+│   ├── run_full_pipeline.py         End-to-end pipeline training
 │   └── push_checkpoints_hf.py      Push model weights to HuggingFace
-├── models/                          gitignored — on HuggingFace
-└── logs/trader/                     gitignored — trade logs
+├── models/
+│   └── transformer/20260623T132957Z/best.pt    Transformer weights (74MB)
+├── data/models/
+│   ├── regime.pkl                   Trained regime agent
+│   ├── aggregator/meta_learner.pkl  Trained meta-learner
+│   └── rl/cql_v1/cql_policy/cql.d3  Trained RL policy
+└── logs/
+    ├── trader/                        Trade logs
+    └── autonomous_trader/             Autonomous trading logs
 ```

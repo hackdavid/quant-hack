@@ -630,6 +630,125 @@ python scripts/test_mt5.py \
 
 ---
 
+## 11. Autonomous Trading (Full Loop)
+
+### What it does
+
+```
+Binance Vision API → 128 historical bars → WebSocket for live bars
+    ↓
+V6 Pipeline (all 5 agents + meta-learner + decision engine)
+    ↓
+LLM Review (Kimi K2.6 via Fireworks AI)
+    ↓
+Risk Manager (drawdown, daily loss, exposure limits)
+    ↓
+MT5 Executor (real orders on Windows, mock on Linux)
+    ↓
+TradeLogger (JSONL logs with full pipeline context)
+```
+
+### Data flow
+
+| Step | Data source | Description |
+|------|-------------|-------------|
+| Historical | `data-api.binance.vision/api/v3/klines` | 128 bars at startup (no warm-up) |
+| Live | `wss://fstream.binance.com/ws/btcusdt@kline_5m` | New 5-min bars as they close |
+| Pipeline | All 5 agents + meta-learner | Full V6 pipeline inference |
+| LLM | Fireworks AI (Kimi K2.6 Turbo) | Risk review + validation |
+| Execution | MT5 (real or mock) | Order placement |
+
+### Setup
+
+```bash
+# 1. Set LLM credentials
+export LLM_TOKEN="fw_..."
+export LLM_BASE_URL="https://api.fireworks.ai/inference"
+export LLM_MODEL="accounts/fireworks/routers/kimi-k2p6-turbo"
+
+# 2. Run mock mode (Linux, no real orders)
+uv run python scripts/autonomous_trader.py \
+    --transformer-run models/transformer/20260623T132957Z \
+    --mt5-account 10408 --mt5-password "..." --mt5-server "..." \
+    --mock-execution --use-llm --interval 5
+
+# 3. Run live (Windows, real MT5 orders)
+uv run python scripts/autonomous_trader.py \
+    --transformer-run models/transformer/20260623T132957Z \
+    --mt5-account 10408 --mt5-password "..." --mt5-server "..." \
+    --use-llm --interval 5
+```
+
+### LLM prompt contents
+
+The LLM receives a structured prompt with:
+- **Pipeline output**: forecast p_up, orderflow bias, regime, risk multiplier, stay_out mode
+- **Candle data**: open, high, low, close, volume, trade_count
+- **Account state**: balance, equity, profit, drawdown
+- **Recent trades**: last 10 decisions with outcomes
+- **Competition rules**: capital limits, risk constraints, drawdown thresholds
+
+### LLM output schema
+
+```json
+{
+  "action": "BUY",
+  "confidence": 0.72,
+  "reason": "Strong uptrend with acceptable risk metrics",
+  "position_size": 0.50,
+  "sl_price": 92000.0,
+  "tp_price": 98000.0,
+  "risk_approved": true
+}
+```
+
+### Position sizing rules
+
+| Confidence | Size | Action |
+|------------|------|--------|
+| < 0.60 | 0% | HOLD |
+| 0.60–0.75 | 25% | BUY/SELL |
+| 0.75–0.85 | 50% | BUY/SELL |
+| > 0.85 | 100% | BUY/SELL |
+
+### Risk constraints enforced
+
+| Rule | Limit |
+|------|-------|
+| Max risk per trade | 0.5% |
+| Max daily loss | 2.0% |
+| Max weekly loss | 5.0% |
+| Hard drawdown | 12.0% |
+| Max exposure | 25.0% |
+| Min confidence | 0.65 |
+| Min R/R | 2.0 |
+
+### Log format
+
+```bash
+# View logs
+ls logs/autonomous_trader/trade_log_YYYY-MM-DD.jsonl
+
+# Python example
+from pathlib import Path
+import json
+p = sorted(Path('logs/autonomous_trader').glob('*.jsonl'))[-1]
+for line in list(open(p))[-10:]:
+    d = json.loads(line)
+    print(f"{d['ts']} | {d['action']:>4} | conf={d['confidence']:.2f} | {d['reason'][:50]}")
+```
+
+### Viewing last N trades for LLM context
+
+```python
+from scripts.autonomous_trader import TradeLogger
+logger = TradeLogger()
+recent = logger.last_n(50)  # last 50 trades
+summary = logger.summary()   # win_rate, avg_return, drawdown
+```
+
+---
+
 ## 9. Quick Reference
 
 ### Command cheat sheet
@@ -655,6 +774,15 @@ uv run intraday rl train \
 uv run python scripts/run_paper_trade.py \
     --transformer-run models/transformer/20260623T132957Z \
     --threshold 0.55 --capital 10000
+
+# Autonomous trader (mock mode)
+uv run python scripts/autonomous_trader.py \
+    --transformer-run models/transformer/20260623T132957Z \
+    --mt5-account 10408 --mt5-password "..." --mt5-server "..." \
+    --mock-execution --use-llm --interval 5
+
+# LLM review test
+uv run python scripts/test_llm_review.py
 ```
 
 ### Minimum data to run inference
