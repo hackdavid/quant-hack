@@ -39,7 +39,10 @@ data/checkpoints/
 # Trained weights: https://huggingface.co/datasets/ibrahimdaud/binance-btcusdt
 models/kronos-base/
 models/kronos-tokenizer/
-# Transformer checkpoints — pushed to HuggingFace after each training run
+# Transformer checkpoints — best.pt pushed to GitHub so clone works offline
+# Ignore intermediate checkpoints and large non-best files
+models/transformer/*/*.pt
+!models/transformer/*/best.pt
 models/forecast/
 models/lgb/
 models/gbm_ensemble/
@@ -109,3 +112,10 @@ models/backtest_results/
 *_run.log
 *_run2.log
 binance_btcusdt_data/
+d3rlpy_logs/
+
+# ── Generated pipeline outputs (not source) ───────────────────────────────────
+data/aggregator_rows/
+data/decisions/
+data/rl_dataset/
+data/v6_results/

@@ -1,6 +1,6 @@
 # Full Pipeline Documentation (V6)
 
-> **Purpose**: This document explains every component, data column, and training procedure so you can run the pipeline, understand its output, and use LLM reasoning over the results. All model weights required for inference are committed to this repo (except the 100M+ param transformer backbone, which is downloaded from HuggingFace).
+> **Purpose**: This document explains every component, data column, and training procedure so you can run the pipeline, understand its output, and use LLM reasoning over the results. All model weights required for inference are committed to this repo (including the transformer).
 
 ---
 
@@ -46,6 +46,71 @@ Every 5-minute bar is represented by **27 columns**. The pipeline needs these to
 - **Minimum window**: `ForecastAgent` requires **128 bars** (≈ 10.7 hours) of history.
 - **Frequency**: All bars are **5-minute** aligned to UTC (`:00`, `:05`, `:10`, etc.).
 - **Missing data**: If `depth_imbalance_1pct` is null (pre-2023), use `0.0`. The model is robust to this.
+
+---
+
+## 1.5 Feature Transformation — How Raw Data Becomes Model Input
+
+The pipeline does **not** expect pre-computed features from any specific provider. It transforms raw OHLCV + order book + funding data into the 20 model features internally. You can feed data from **any exchange** (Binance, Bybit, OKX, Coinbase, etc.) as long as you provide the raw fields below.
+
+### Required raw input (per 5-min bar)
+
+| Raw Field | Source Example | Used to compute |
+|-----------|---------------|-----------------|
+| `timestamp_ms` | Any exchange timestamp | `bar_time_ms` |
+| `open`, `high`, `low`, `close` | OHLC candle | `log_ret_*`, `rsi_14` |
+| `volume` | Base or quote volume | `vol_5m`, `avg_trade_size_5m` |
+| `taker_buy_volume` | Aggressive buy volume | `taker_buy_ratio_5m` |
+| `trade_count` | Number of trades | `trade_count_5m`, `avg_trade_size_5m` |
+| `bid_depth_1pct`, `ask_depth_1pct` | Order book depth at 1% | `depth_imbalance_1pct` |
+| `funding_rate` | Perpetual funding | `funding_rate` |
+| `open_interest` | OI in contracts | `oi_btc`, `oi_change_1h` |
+| `long_short_ratio` | Account or volume ratio | `ls_count_ratio`, `taker_ls_vol_ratio` |
+
+### Computed features (formulas)
+
+| Feature | Formula | Rolling Window |
+|---------|---------|----------------|
+| `log_ret_1m` | `ln(close_t / close_{t-1})` | 1 bar (if 1m sub-bars) |
+| `log_ret_5m` | `ln(close_t / close_{t-1})` | 1 bar (5-min) |
+| `log_ret_15m` | `mean(log_ret_1m over 3 bars)` | 3 bars |
+| `log_ret_60m` | `mean(log_ret_1m over 12 bars)` | 12 bars |
+| `realized_vol_30m` | `std(log_ret_1m over 6 bars)` | 6 bars |
+| `rsi_14` | Standard RSI on 1-min closes | 14 bars |
+| `depth_imbalance_1pct` | `(bid_depth - ask_depth) / (bid_depth + ask_depth)` | Current bar only |
+| `vpin_50` | See `intraday/features/vpin.py` | 50-volume buckets |
+| `hawkes_buy/sell_intensity` | See `intraday/features/hawkes.py` | Exponential decay kernel |
+| `oi_change_1h` | `(oi_t - oi_{t-12}) / oi_{t-12}` | 12 bars |
+
+### Provider swap guide
+
+To use a different data provider (e.g., Bybit, OKX, Coinbase, or your own websocket):
+
+1. **Implement a feature adapter** that converts provider-specific fields to the raw schema above:
+```python
+# src/intraday/adapters/bybit_adapter.py
+import polars as pl
+
+def bybit_bars_to_features(raw_df: pl.DataFrame) -> pl.DataFrame:
+    """Convert Bybit 5-min klines to our feature schema."""
+    return raw_df.with_columns([
+        pl.col("volume").alias("vol_5m"),
+        (pl.col("turnover") / pl.col("volume")).alias("avg_trade_size_5m"),
+        # ... map remaining fields
+    ])
+```
+
+2. **Replace the data loader** in `run_pipeline_json.py`:
+```python
+# Instead of:
+# df = pl.read_parquet("data/features/BTCUSDT/2026-01-01.parquet")
+
+# Use:
+# raw_df = fetch_bybit_klines("BTCUSDT", "2026-01-01")
+# df = bybit_bars_to_features(raw_df)
+```
+
+3. **The rest of the pipeline is provider-agnostic**. All agents only consume the 20 standardized features.
 
 ---
 

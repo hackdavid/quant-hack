@@ -333,19 +333,23 @@ All checkpoints at: **[ibrahimdaud/binance-btcusdt → checkpoints/](https://hug
 | `gbm_ensemble/` | GBDT + DART + XGBoost blend, 200+ features | Best standalone GBM prediction |
 
 ### Download checkpoints
+All checkpoints are now **committed to this repo** so you can clone and run immediately without HuggingFace:
+
+```bash
+# Transformer (already in repo)
+ls models/transformer/20260623T132957Z/best.pt
+
+# Meta-learner, regime, RL (already in repo)
+ls data/models/
+```
+
+If you want to download from HuggingFace instead:
 ```bash
 from huggingface_hub import hf_hub_download, snapshot_download
 
-# Best transformer only
 hf_hub_download(
     "ibrahimdaud/binance-btcusdt", repo_type="dataset",
     filename="checkpoints/transformer_v2/best.pt", local_dir="."
-)
-
-# All checkpoints
-snapshot_download(
-    "ibrahimdaud/binance-btcusdt", repo_type="dataset",
-    local_dir=".", allow_patterns=["checkpoints/*"]
 )
 ```
 
