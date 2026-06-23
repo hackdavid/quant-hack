@@ -6,6 +6,7 @@ Exported names:
     RegimeAgent       — HMM + LightGBM regime classifier (learnable)
     RiskAgent         — Hard-cap risk gatekeeper (rule-based)
     StayOutDetector   — News-shock / extreme-event detector (rule-based)
+    ForecastAgent     — Transformer-based direction forecast (learnable)
 """
 
 from intraday.agents.base import Agent, AgentOpinion
@@ -19,6 +20,7 @@ from intraday.agents.regime import (
 )
 from intraday.agents.risk import RiskAgent, RiskConfig
 from intraday.agents.stay_out import StayOutDetector
+from intraday.agents.forecast import ForecastAgent
 
 __all__ = [
     "Agent",
@@ -32,4 +34,5 @@ __all__ = [
     "RiskAgent",
     "RiskConfig",
     "StayOutDetector",
+    "ForecastAgent",
 ]

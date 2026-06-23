@@ -1,163 +1,97 @@
-"""News-shock / extreme-event stay-out detector.
-
-Rule-based, no ML. Uses rolling z-scores of market stress indicators to flag
-'stay_out' (score > 3.0) or 'defensive' (score > 2.0) conditions.
-"""
-
+"""StayOutDetector — rule-based filter to skip low-quality trading conditions."""
+from __future__ import annotations
 import time
-from collections import deque
-from typing import Any
 
-import structlog
+import numpy as np
 
 from intraday.agents.base import Agent, AgentOpinion
 
-log = structlog.get_logger(__name__)
-
-_MIN_OBS = 10  # Minimum observations before z-scores are reliable
-
-
-def _safe_float(v: Any, default: float = 0.0) -> float:
-    if v is None:
-        return default
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
-
-
-class _OnlineZScore:
-    """Online Welford mean/variance for a fixed-length rolling window."""
-
-    __slots__ = ("_window", "_buf", "_n", "_mean", "_M2")
-
-    def __init__(self, window: int) -> None:
-        self._window = window
-        self._buf: deque[float] = deque()
-        self._n: int = 0
-        self._mean: float = 0.0
-        self._M2: float = 0.0
-
-    def update(self, x: float) -> float:
-        """Push x into the window, return z-score of x (or 0 if insufficient data)."""
-        self._buf.append(x)
-        self._n += 1
-        delta = x - self._mean
-        self._mean += delta / self._n
-        delta2 = x - self._mean
-        self._M2 += delta * delta2
-
-        if len(self._buf) > self._window:
-            old = self._buf.popleft()
-            self._n -= 1
-            if self._n == 0:
-                self._mean = 0.0
-                self._M2 = 0.0
-            else:
-                delta_old = old - self._mean
-                self._mean -= delta_old / self._n
-                delta_old2 = old - self._mean
-                self._M2 -= delta_old * delta_old2
-                if self._M2 < 0.0:
-                    self._M2 = 0.0
-
-        if self._n < _MIN_OBS:
-            return 0.0
-
-        std = (self._M2 / self._n) ** 0.5
-        if std < 1e-9:
-            return 0.0
-        return (x - self._mean) / std
-
 
 class StayOutDetector(Agent):
-    """Detects news-shock and extreme-event conditions."""
-
     name = "stay_out"
-    STAY_OUT_THRESHOLD: float = 3.0
-    DEFENSIVE_THRESHOLD: float = 2.0
-    WINDOW: int = 60  # bars for rolling z-score
 
-    def __init__(self) -> None:
-        self._z_vol = _OnlineZScore(self.WINDOW)
-        self._z_spread = _OnlineZScore(self.WINDOW)
-        self._z_oi = _OnlineZScore(self.WINDOW)
-        self._z_abs_ret = _OnlineZScore(self.WINDOW)
-        log.debug("stay_out_detector_init", window=self.WINDOW)
+    def __init__(self,
+                 dead_vol: float = 0.0003,
+                 spike_mult: float = 3.0,
+                 quiet_hours_utc: tuple = (0, 1, 2, 3, 4),
+                 max_oi_change: float = 0.05) -> None:
+        self.dead_vol = dead_vol
+        self.spike_mult = spike_mult
+        self.quiet_hours = set(quiet_hours_utc)
+        self.max_oi_chg = max_oi_change
 
-    def predict(self, features: dict[str, Any]) -> AgentOpinion:
-        """Evaluate market stress and return stay-out mode.
+    def _safe(self, df, col, default=0.0):
+        if isinstance(df, dict):
+            v = df.get(col, default)
+            return float(v) if v is not None else default
+        if col not in df.columns:
+            return default
+        v = df[col].tail(1)[0]
+        return float(v) if v is not None else default
 
-        Expected feature keys:
-            realized_vol_30m  — rolling realised volatility
-            taker_buy_ratio_5m — used as a proxy for spread pressure when extreme
-            oi_change_1h      — fractional OI change
-            rsi_14            — RSI(14), not directly z-scored but used to inform
-            log_ret_5m        — single-bar log return (abs → z-scored)
-        """
+    def _predict_raw(self, history_df) -> tuple[bool, str]:
+        # Dead market: last 3 bars all below vol floor
+        if "realized_vol_30m" in history_df.columns:
+            last3 = [v for v in history_df["realized_vol_30m"].tail(3).to_list() if v]
+            if len(last3) == 3 and all(v < self.dead_vol for v in last3):
+                return True, "dead_market"
+        elif isinstance(history_df, dict):
+            vol = self._safe(history_df, "realized_vol_30m", 0.0)
+            if vol < self.dead_vol:
+                return True, "dead_market"
+
+        # Quiet UTC hours (low BTC liquidity)
+        if "bar_time_ms" in history_df.columns:
+            ts = history_df["bar_time_ms"].tail(1)[0]
+            if ts is not None:
+                hour = (int(ts) // 3_600_000) % 24
+                if hour in self.quiet_hours:
+                    return True, "quiet_hours"
+        elif isinstance(history_df, dict):
+            ts = history_df.get("bar_time_ms")
+            if ts is not None:
+                hour = (int(ts) // 3_600_000) % 24
+                if hour in self.quiet_hours:
+                    return True, "quiet_hours"
+
+        # Vol spike: last bar > spike_mult × rolling mean
+        if "realized_vol_30m" in history_df.columns:
+            vols = [v for v in history_df["realized_vol_30m"].tail(31).to_list() if v]
+            if len(vols) > 5:
+                last_vol = vols[-1]
+                mean_vol = np.mean(vols[:-1])
+                if mean_vol > 0 and last_vol > self.spike_mult * mean_vol:
+                    return True, "vol_spike"
+        elif isinstance(history_df, dict):
+            vol = self._safe(history_df, "realized_vol_30m", 0.0)
+            if vol > self.dead_vol * self.spike_mult:
+                return True, "vol_spike"
+
+        # OI extreme change
+        oi = abs(self._safe(history_df, "oi_change_1h", 0.0))
+        if oi > self.max_oi_chg:
+            return True, "oi_extreme"
+
+        return False, ""
+
+    def predict(self, history_df) -> AgentOpinion:
         t0 = time.perf_counter()
-        ts_ms = int(features.get("bar_time_ms") or (time.time() * 1000))
-
-        realized_vol = _safe_float(features.get("realized_vol_30m"), 0.0)
-        tbr = _safe_float(features.get("taker_buy_ratio_5m"), 0.5)
-        oi_chg = _safe_float(features.get("oi_change_1h"), 0.0)
-        log_ret = _safe_float(features.get("log_ret_5m"), 0.0)
-
-        # taker_buy_ratio used as spread proxy: extremes (near 0 or 1) signal wide spreads
-        spread_proxy = abs(tbr - 0.5) * 2.0  # maps [0,1] → [0,1], max at extremes
-
-        abs_ret = abs(log_ret)
-
-        # Update rolling z-scorers
-        z_vol = self._z_vol.update(realized_vol)
-        z_spread = self._z_spread.update(spread_proxy)
-        z_oi = self._z_oi.update(oi_chg)
-        z_abs_ret = self._z_abs_ret.update(abs_ret)
-
-        # Aggregate stress score: worst of the four z-scores
-        score = max(z_vol, z_spread, abs(z_oi), z_abs_ret)
-
-        # Determine mode
-        if score > self.STAY_OUT_THRESHOLD:
-            mode = "stay_out"
-        elif score > self.DEFENSIVE_THRESHOLD:
-            mode = "defensive"
-        else:
-            mode = "normal"
-
-        drivers: dict[str, float] = {
-            "z_realized_vol": round(z_vol, 6),
-            "z_spread_proxy": round(z_spread, 6),
-            "z_oi_change": round(z_oi, 6),
-            "z_abs_ret": round(z_abs_ret, 6),
-        }
-
-        # Confidence inversely correlated with severity of stay-out
-        if mode == "stay_out":
-            confidence = 1.0
-        elif mode == "defensive":
-            confidence = 0.7
-        else:
-            confidence = 0.3
-
-        inference_ms = (time.perf_counter() - t0) * 1000.0
-
-        log.debug(
-            "stay_out_predict",
-            mode=mode,
-            score=round(score, 4),
-            drivers=drivers,
-            inference_ms=round(inference_ms, 3),
-        )
-
+        stay_out, reason = self._predict_raw(history_df)
+        payload = self.signal_dict(history_df)
+        ts = self._safe(history_df, "bar_time_ms", 0)
         return AgentOpinion(
             agent=self.name,
-            ts_ms=ts_ms,
-            payload={
-                "mode": mode,
-                "score": round(score, 6),
-                "drivers": drivers,
-            },
-            confidence=confidence,
-            inference_ms=inference_ms,
+            ts_ms=int(ts) if ts else 0,
+            payload=payload,
+            confidence=0.0 if stay_out else 1.0,
+            inference_ms=(time.perf_counter() - t0) * 1000.0,
         )
+
+    def signal_dict(self, history_df) -> dict:
+        stay_out, reason = self._predict_raw(history_df)
+        return {
+            "stay_out": stay_out,
+            "stay_out_reason": reason,
+            "mode": "stay_out" if stay_out else "normal",
+            "score": 1.0 if stay_out else 0.0,
+        }

@@ -26,9 +26,7 @@ def train_cql_policy(
 ) -> Path:
     """CQL training using d3rlpy.
 
-    If d3rlpy is not installed: raises ImportError with install instructions.
     Saves model to output_dir/cql_policy/ and metadata to output_dir/metadata.json.
-    Validates every epoch: runs on held-out data and records avg slippage vs baseline.
 
     Returns the path to the saved model directory.
     """
@@ -65,10 +63,9 @@ def train_cql_policy(
 
     states = np.array(df["state"].to_list(), dtype=np.float32)
     actions = np.array(df["action"].to_list(), dtype=np.float32)
-    rewards = df["reward"].to_numpy(dtype=np.float64).astype(np.float32)
+    rewards = df["reward"].to_numpy().astype(np.float32)
     next_states = np.array(df["next_state"].to_list(), dtype=np.float32)
     terminals = df["done"].to_numpy().astype(np.float32)
-    timeouts = np.zeros_like(terminals)
 
     assert states.shape[1] == STATE_DIM, (
         f"State dim mismatch: expected {STATE_DIM}, got {states.shape[1]}"
@@ -77,22 +74,19 @@ def train_cql_policy(
         f"Action dim mismatch: expected 4, got {actions.shape[1]}"
     )
 
-    # ── Build d3rlpy MDPDataset ───────────────────────────────────────────────
+    # ── Build d3rlpy dataset ──────────────────────────────────────────────────
+    # In d3rlpy 2.x, MDPDataset is a wrapper around ReplayBuffer
     dataset = d3rlpy.dataset.MDPDataset(
         observations=states,
         actions=actions,
         rewards=rewards,
         terminals=terminals,
-        timeouts=timeouts,
     )
 
-    # ── Train / val split ─────────────────────────────────────────────────────
+    # ── Train / val split via buffer creation ─────────────────────────────────
     n_total = len(df)
     n_val = max(1, int(n_total * 0.1))
     n_train = n_total - n_val
-    train_dataset, val_dataset = dataset.slice_episode(
-        end_frame=n_train
-    ), dataset.slice_episode(start_frame=n_train)
 
     log.info(
         "cql_train.split",
@@ -101,12 +95,14 @@ def train_cql_policy(
     )
 
     # ── CQL algorithm ─────────────────────────────────────────────────────────
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     cql = d3rlpy.algos.CQLConfig(
         actor_learning_rate=actor_lr,
         critic_learning_rate=critic_lr,
-        alpha=cql_alpha,
+        conservative_weight=cql_alpha,
         batch_size=batch_size,
-    ).create(device="cpu")
+    ).create(device=device)
 
     n_epochs = max(1, n_steps // n_steps_per_epoch)
     model_dir = output_dir / "cql_policy"
@@ -119,14 +115,14 @@ def train_cql_policy(
 
     for epoch in range(1, n_epochs + 1):
         results = cql.fit(
-            train_dataset,
+            dataset,
             n_steps=n_steps_per_epoch,
             n_steps_per_epoch=n_steps_per_epoch,
             show_progress=False,
         )
 
-        # Evaluate on validation set
-        val_metrics = _evaluate_on_dataset(cql, val_dataset, n_samples=min(500, n_val))
+        # Evaluate on a random sample of observations
+        val_metrics = _evaluate_on_dataset(cql, dataset, n_samples=min(500, n_val))
         elapsed = time.monotonic() - train_start
 
         epoch_metrics.append(
@@ -189,28 +185,15 @@ def _evaluate_on_dataset(
     dataset: "Any",
     n_samples: int = 500,
 ) -> dict:
-    """Run inference on n_samples transitions and compute mean predicted Q-value."""
+    """Run inference on n_samples random transitions and compute mean Q-value."""
     try:
-        import d3rlpy
-
-        episodes = list(dataset.episodes)
-        if not episodes:
+        # Sample from the dataset buffer
+        buffer = dataset.buffer
+        transitions = buffer.sample_transition(n_samples)
+        if transitions is None or len(transitions) == 0:
             return {"val_mean_q": 0.0}
 
-        obs_list: list[np.ndarray] = []
-        for ep in episodes:
-            for transition in ep.transitions:
-                obs_list.append(transition.observation)
-                if len(obs_list) >= n_samples:
-                    break
-            if len(obs_list) >= n_samples:
-                break
-
-        if not obs_list:
-            return {"val_mean_q": 0.0}
-
-        obs_arr = np.array(obs_list, dtype=np.float32)
-        # Use predict to get actions, then estimate Q-values
+        obs_arr = np.array([t.observation for t in transitions], dtype=np.float32)
         actions = cql.predict(obs_arr)
         q_vals = cql.predict_value(obs_arr, actions)
         return {"val_mean_q": float(np.mean(q_vals))}

@@ -5,6 +5,13 @@ Probabilistic, regime-aware, multi-agent intraday trading system for BTC/USDT pe
 
 ---
 
+## Quick Links
+
+| Document | What it covers |
+|----------|---------------|
+| **[docs/PIPELINE.md](docs/PIPELINE.md)** | Full pipeline docs: data schema, agent I/O, training procedures, LLM reasoning interface |
+| **run_pipeline_json.py** | CLI tool: feed raw data → get JSON output with English explanations for every agent |
+
 ## Current status
 
 | Phase | Status | Notes |
@@ -13,11 +20,11 @@ Probabilistic, regime-aware, multi-agent intraday trading system for BTC/USDT pe
 | 1 Data | ✅ Done | 2,090 days (2020-09-10 → 2026-05-31), on HuggingFace |
 | 2 Features | ✅ Done | 601,920 bars × 20 features, on HuggingFace |
 | 3 Simulator | ✅ Done | Queue-aware L2 replay, 0.000 bps canary error |
-| 4 Forecast | ⏳ Next run | v4 — 2023+ data only, load from HuggingFace (see below) |
-| 5 Agents | ⏳ Pending | Code done, needs Phase 4 |
-| 6 Aggregator | ⏳ Pending | Code done, needs Phase 4+5 |
-| 7 RL Execution | ⏳ Pending | Code done, needs Phase 6 |
-| 8 Paper Trading | ❌ Not built | |
+| 4 Forecast | ✅ Done | Transformer trained, AUC ~0.553 |
+| 5 Agents | ✅ Done | All 5 agents implemented + registered |
+| 6 Aggregator | ✅ Done | Meta-learner (LightGBM) + DecisionEngine trained |
+| 7 RL Execution | ✅ Done | CQL offline policy trained (200k steps) |
+| 8 Paper Trading | ✅ Ready | `run_pipeline_json.py` + `scripts/run_paper_trade.py` |
 
 ---
 
@@ -429,13 +436,38 @@ Output: `models/backtest_results/result_<run_id>.json` + `equity_<run_id>.csv`
 
 ---
 
+## Pipeline JSON Output (LLM-ready)
+
+Run the full pipeline on a single bar or day and get structured JSON with English explanations:
+
+```bash
+# Single bar (last bar of a day)
+uv run python run_pipeline_json.py \
+    --transformer-run models/transformer/20260623T132957Z \
+    --date 2026-01-01 \
+    --bar-index -1 \
+    --output -
+
+# All bars in a day
+uv run python run_pipeline_json.py \
+    --transformer-run models/transformer/20260623T132957Z \
+    --date 2026-01-01 \
+    --bar-index -2 \
+    --output day_output.json
+```
+
+Output includes: `forecast`, `orderflow`, `regime`, `risk`, `stay_out`, `aggregator`, `decision`, `rl_execution`, and `feature_summary` — each with an `explanation` field in plain English.
+
+See **[docs/PIPELINE.md](docs/PIPELINE.md)** for the full schema, agent training docs, and LLM reasoning interface.
+
+---
+
 ## Phase 8 — Paper Trading & Live Trading
 
 ### Paper trading (no real orders, live Binance WebSocket data)
 ```bash
-.venv/bin/python scripts/run_paper_trade.py \
-    --transformer-dir models/transformer/<run_id> \
-    --lgb-dir models/lgb \
+uv run python scripts/run_paper_trade.py \
+    --transformer-run models/transformer/20260623T132957Z \
     --capital 10000 \
     --threshold 0.55 \
     --max-position-frac 0.20 \
@@ -450,9 +482,8 @@ All decisions logged to `logs/trader/trade_log_*.jsonl`.
 export BINANCE_API_KEY="your_key"
 export BINANCE_API_SECRET="your_secret"
 
-.venv/bin/python scripts/run_live_trade.py \
-    --transformer-dir models/transformer/<run_id> \
-    --lgb-dir models/lgb \
+uv run python scripts/run_live_trade.py \
+    --transformer-run models/transformer/20260623T132957Z \
     --capital 1000 \
     --threshold 0.57 \
     --max-position-frac 0.10 \

@@ -22,6 +22,6 @@ class Agent(ABC):
     name: str
 
     @abstractmethod
-    def predict(self, features: dict[str, Any]) -> AgentOpinion:
-        """Produce an opinion from a feature dict."""
+    def predict(self, history_df) -> AgentOpinion:
+        """Produce an opinion from a feature dict or DataFrame."""
         ...

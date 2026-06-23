@@ -59,9 +59,10 @@ def _auto_register() -> None:
     from intraday.agents.regime import RegimeAgent  # noqa: F401
     from intraday.agents.risk import RiskAgent  # noqa: F401
     from intraday.agents.stay_out import StayOutDetector  # noqa: F401
+    from intraday.agents.forecast import ForecastAgent  # noqa: F401
 
     # Register built-in agents if not already registered
-    for cls in (OrderflowAgent, RegimeAgent, RiskAgent, StayOutDetector):
+    for cls in (OrderflowAgent, RegimeAgent, RiskAgent, StayOutDetector, ForecastAgent):
         if cls.name not in _REGISTRY:
             _REGISTRY[cls.name] = cls
 

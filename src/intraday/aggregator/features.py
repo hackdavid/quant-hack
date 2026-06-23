@@ -69,6 +69,7 @@ def build_aggregator_row(
     fc_meta_act_int = 1 if forecast.meta_act else 0
 
     row: dict = {
+        "ts_ms": forecast.ts_ms,
         "fc_p_up": forecast.p_up_05sigma,
         "fc_p_down": forecast.p_down_05sigma,
         "fc_expected_move_sigma": forecast.expected_move_sigma,

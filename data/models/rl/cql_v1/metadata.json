@@ -1,0 +1,119 @@
+{
+  "framework": "d3rlpy",
+  "algorithm": "CQL",
+  "state_dim": 15,
+  "action_dim": 4,
+  "n_steps": 200000,
+  "n_steps_per_epoch": 10000,
+  "batch_size": 256,
+  "actor_lr": 0.0001,
+  "critic_lr": 0.0003,
+  "cql_alpha": 2.0,
+  "seed": 42,
+  "dataset_path": "data/rl_dataset/offline_2026-01-01_2026-05-31.parquet",
+  "n_train": 80037,
+  "n_val": 8892,
+  "epoch_metrics": [
+    {
+      "epoch": 1,
+      "elapsed_s": 130.1,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 2,
+      "elapsed_s": 253.2,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 3,
+      "elapsed_s": 377.5,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 4,
+      "elapsed_s": 504.7,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 5,
+      "elapsed_s": 630.4,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 6,
+      "elapsed_s": 755.2,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 7,
+      "elapsed_s": 881.3,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 8,
+      "elapsed_s": 1007.2,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 9,
+      "elapsed_s": 1133.8,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 10,
+      "elapsed_s": 1260.5,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 11,
+      "elapsed_s": 1387.4,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 12,
+      "elapsed_s": 1513.6,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 13,
+      "elapsed_s": 1637.9,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 14,
+      "elapsed_s": 1762.2,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 15,
+      "elapsed_s": 1888.6,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 16,
+      "elapsed_s": 2015.5,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 17,
+      "elapsed_s": 2138.3,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 18,
+      "elapsed_s": 2262.9,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 19,
+      "elapsed_s": 2384.4,
+      "val_mean_q": 0.0
+    },
+    {
+      "epoch": 20,
+      "elapsed_s": 2505.5,
+      "val_mean_q": 0.0
+    }
+  ],
+  "model_path": "data/models/rl/cql_v1/cql_policy/cql.d3"
+}

@@ -39,11 +39,11 @@ data/checkpoints/
 # Trained weights: https://huggingface.co/datasets/ibrahimdaud/binance-btcusdt
 models/kronos-base/
 models/kronos-tokenizer/
-# Trained checkpoints — pushed to HuggingFace after each training run
+# Transformer checkpoints — pushed to HuggingFace after each training run
 models/forecast/
-models/aggregator/
-models/regime/
-models/rl/
+models/lgb/
+models/gbm_ensemble/
+models/backtest_results/
 # Standalone model checkpoints (experiment runs)
 checkpoints/
 

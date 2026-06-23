@@ -6,11 +6,12 @@ Sub-commands:
     inspect — show opinions across a date range in a Rich table
 """
 
+import inspect
 import json
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import polars as pl
 import structlog
@@ -91,7 +92,15 @@ def agent_train(
     _ensure_registered()
 
     try:
-        agent = get_agent(name, model_dir=model_out.parent if model_out else None)
+        # Only pass model_dir if the agent accepts it (RegimeAgent doesn't)
+        agent_cls = _REGISTRY.get(name)
+        if agent_cls is None:
+            raise KeyError(f"Unknown agent '{name}'")
+        sig = inspect.signature(agent_cls.__init__)
+        kwargs: dict[str, Any] = {}
+        if model_out and "model_dir" in sig.parameters:
+            kwargs["model_dir"] = model_out.parent
+        agent = agent_cls(**kwargs)
     except KeyError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
@@ -159,8 +168,7 @@ def agent_predict(
 
     # ── Load agent ────────────────────────────────────────────────────────
     try:
-        if model_path and model_path.exists() and hasattr(get_agent.__class__, "load"):
-            # Try class-level load
+        if model_path and model_path.exists():
             from intraday.agents import RegimeAgent
             if name == "regime":
                 agent = RegimeAgent.load(model_path)
