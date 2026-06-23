@@ -99,3 +99,13 @@ scratch/
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 *.ipynb
+
+# ── New model checkpoints (pushed to HuggingFace, not git) ───────────────────
+models/transformer/
+models/lgb/
+models/gbm_ensemble/
+models/backtest_results/
+*.pt
+*_run.log
+*_run2.log
+binance_btcusdt_data/

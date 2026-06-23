@@ -291,3 +291,211 @@ quant-hack/
 ## Disclaimer
 
 Research software. Cryptocurrency trading carries significant risk of loss. Not financial advice.
+
+---
+
+## Phase 4 — Forecast Models (Completed)
+
+Three models trained, checkpoints on HuggingFace under `checkpoints/`.
+
+### Results
+
+| Model | Val AUC | Train time | Notes |
+|-------|---------|-----------|-------|
+| LightGBM baseline | 0.5476 | ~2 min | 119 features, early stopped at round 48 |
+| CryptoTransformer v1 | 0.5536 (ep5) | ~40 min | d=256, 8L, overfit after ep5 |
+| CryptoTransformer v2 | **0.5531 (ep5)** | ~11 min | dropout=0.2, wd=0.05, early stop ✓ |
+| GBM Ensemble | pending | ~75 min | GBDT + DART + XGBoost, 200+ features |
+
+### What we learned
+- Kronos (102M frozen) + LoRA dominated by irrelevant pretrained representations → replaced with pure CryptoTransformer
+- Signal peaks very early (ep 4–6) then overfits sharply → early stopping essential
+- LightGBM AUC 0.547 → Transformer AUC 0.553 → ensemble expected 0.56+
+- Top predictors: `depth_imbalance_1pct`, `ls_count_ratio`, `vpin_50`, `taker_buy_ratio_5m`, `oi_change_1h`
+
+---
+
+## Model Checkpoints (HuggingFace)
+
+All checkpoints at: **[ibrahimdaud/binance-btcusdt → checkpoints/](https://huggingface.co/datasets/ibrahimdaud/binance-btcusdt/tree/main/checkpoints)**
+
+| Checkpoint folder | What it is | When to use |
+|------------------|-----------|------------|
+| `transformer_v2/best.pt` | CryptoTransformer, 6.4M params, AUC 0.553 | Real-time inference, sequence-aware |
+| `lgb_baseline/lgb_model.txt` | LightGBM GBDT, 119 features, AUC 0.548 | Fast fallback, no GPU needed |
+| `gbm_ensemble/` | GBDT + DART + XGBoost blend, 200+ features | Best standalone GBM prediction |
+
+### Download checkpoints
+```bash
+from huggingface_hub import hf_hub_download, snapshot_download
+
+# Best transformer only
+hf_hub_download(
+    "ibrahimdaud/binance-btcusdt", repo_type="dataset",
+    filename="checkpoints/transformer_v2/best.pt", local_dir="."
+)
+
+# All checkpoints
+snapshot_download(
+    "ibrahimdaud/binance-btcusdt", repo_type="dataset",
+    local_dir=".", allow_patterns=["checkpoints/*"]
+)
+```
+
+### Push new checkpoints after training
+```bash
+export HUGGINGFACE_TOKEN="hf_..."
+python scripts/push_checkpoints_hf.py           # push all
+python scripts/push_checkpoints_hf.py --only transformer
+python scripts/push_checkpoints_hf.py --only lgb
+python scripts/push_checkpoints_hf.py --only gbm_ensemble
+```
+
+---
+
+## Training Pipeline
+
+### 1. Download feature data
+```bash
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('ibrahimdaud/binance-btcusdt', repo_type='dataset',
+                  local_dir='.', ignore_patterns=['raw/*'])
+"
+```
+
+### 2. Train LightGBM baseline (~2 min)
+```bash
+.venv/bin/python scripts/train_lgb.py \
+    --features-dir data/features/BTCUSDT \
+    --output-dir models/lgb
+```
+
+### 3. Train GBM Ensemble (GBDT + DART + XGBoost, ~75 min)
+```bash
+.venv/bin/python scripts/train_gbm_ensemble.py \
+    --features-dir data/features/BTCUSDT \
+    --output-dir models/gbm_ensemble
+```
+
+### 4. Train CryptoTransformer (~10-15 min with early stopping)
+```bash
+# Default config (best settings found)
+PYTHONUNBUFFERED=1 .venv/bin/python -m intraday.forecast.train_transformer \
+    --dropout 0.2 --weight-decay 0.05 --lr 5e-5 \
+    --epochs 50 --patience 10 \
+    --output-dir models/transformer
+
+# Resume from checkpoint
+.venv/bin/python -m intraday.forecast.train_transformer \
+    --resume-from models/transformer/<run_id>/latest.pt
+```
+
+### 5. Push to HuggingFace
+```bash
+export HUGGINGFACE_TOKEN="hf_..."
+.venv/bin/python scripts/push_checkpoints_hf.py
+```
+
+---
+
+## Backtesting
+
+```bash
+# LightGBM only (fast, no GPU)
+.venv/bin/python scripts/run_backtest.py --lgb-dir models/lgb
+
+# Transformer only
+.venv/bin/python scripts/run_backtest.py \
+    --transformer-dir models/transformer/<run_id>
+
+# Ensemble: transformer + LGB
+.venv/bin/python scripts/run_backtest.py \
+    --transformer-dir models/transformer/<run_id> \
+    --lgb-dir models/lgb
+
+# Sweep thresholds 0.50–0.65 to find best Sharpe
+.venv/bin/python scripts/run_backtest.py \
+    --transformer-dir models/transformer/<run_id> \
+    --lgb-dir models/lgb \
+    --sweep
+
+# GBM ensemble
+.venv/bin/python scripts/run_backtest.py \
+    --lgb-ensemble-dir models/gbm_ensemble
+```
+
+Output: `models/backtest_results/result_<run_id>.json` + `equity_<run_id>.csv`
+
+---
+
+## Phase 8 — Paper Trading & Live Trading
+
+### Paper trading (no real orders, live Binance WebSocket data)
+```bash
+.venv/bin/python scripts/run_paper_trade.py \
+    --transformer-dir models/transformer/<run_id> \
+    --lgb-dir models/lgb \
+    --capital 10000 \
+    --threshold 0.55 \
+    --max-position-frac 0.20 \
+    --daily-loss-limit 0.02
+```
+
+All decisions logged to `logs/trader/trade_log_*.jsonl`.
+
+### Live trading (real Binance USDT-M futures)
+> ⚠️ Run paper trading for ≥ 1 week with OOS Sharpe ≥ 1.0 before going live.
+```bash
+export BINANCE_API_KEY="your_key"
+export BINANCE_API_SECRET="your_secret"
+
+.venv/bin/python scripts/run_live_trade.py \
+    --transformer-dir models/transformer/<run_id> \
+    --lgb-dir models/lgb \
+    --capital 1000 \
+    --threshold 0.57 \
+    --max-position-frac 0.10 \
+    --leverage 1
+```
+
+### Risk defaults
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--threshold` | 0.55 paper / 0.57 live | Min prob to trade |
+| `--max-position-frac` | 0.20 / 0.10 | Max % capital per trade |
+| `--daily-loss-limit` | 2% / 1% | Stop trading today if exceeded |
+| `--max-drawdown` | 5% / 3% | Halt permanently (resets next UTC day) |
+| `--leverage` | 1x | Start with 1x until validated |
+
+---
+
+## Updated Project Layout
+
+```
+quant-hack/
+├── src/intraday/
+│   ├── forecast/
+│   │   ├── transformer_model.py     CryptoTransformer (6.4M params)
+│   │   ├── train_transformer.py     Training loop with early stopping + checkpoints
+│   │   ├── train.py                 Original Kronos training loop
+│   │   └── ...
+│   ├── backtest/
+│   │   └── engine.py                Vectorized backtest (fees, funding, slippage)
+│   ├── signal/
+│   │   └── combiner.py              Loads transformer + LGB, blends by val AUC
+│   ├── risk/
+│   │   └── agent.py                 Kelly sizing, daily loss limit, max drawdown halt
+│   └── trader/
+│       ├── exchange.py              Binance wrapper (paper + live via ccxt)
+│       └── loop.py                  Async WebSocket trading loop
+├── scripts/
+│   ├── train_lgb.py                 LightGBM baseline training
+│   ├── train_gbm_ensemble.py        GBDT + DART + XGBoost ensemble
+│   ├── run_backtest.py              Backtesting with threshold sweep
+│   ├── run_paper_trade.py           Paper trading (live WS, no orders)
+│   ├── run_live_trade.py            Live trading (real Binance futures)
+│   └── push_checkpoints_hf.py      Push model weights to HuggingFace
+├── models/                          gitignored — on HuggingFace
+└── logs/trader/                     gitignored — trade logs
+```
