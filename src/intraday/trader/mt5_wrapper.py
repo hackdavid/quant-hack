@@ -430,31 +430,81 @@ class MT5TradingWrapper:
                 fixed_tp = round(price - min_distance * 2, 3)
                 log.info("tp_adjusted_tick", symbol=symbol, price=price, old_tp=tp, new_tp=fixed_tp, min_distance=min_distance)
 
-        request = {
-            "action": self._mt5.TRADE_ACTION_DEAL,
-            "symbol": mt5_sym,
-            "volume": float(volume),
-            "type": order_type,
-            "price": price,
-            "sl": float(fixed_sl),
-            "tp": float(fixed_tp),
-            "deviation": 20,
-            "magic": self.magic,
-            "comment": comment,
-            "type_time": self._mt5.ORDER_TIME_GTC,
-            "type_filling": self._mt5.ORDER_FILLING_IOC,
-        }
+        # Check symbol limits and split if needed
+        sym_info = self._mt5.symbol_info(mt5_sym)
+        max_vol = getattr(sym_info, "volume_max", volume) if sym_info else volume
+        vol_step = getattr(sym_info, "volume_step", 0.01) if sym_info else 0.01
+        volume = round(volume / vol_step) * vol_step
 
-        result = self._mt5.order_send(request)
+        fillings = [
+            self._mt5.ORDER_FILLING_IOC,
+            self._mt5.ORDER_FILLING_FOK,
+            self._mt5.ORDER_FILLING_RETURN,
+        ]
+
+        # Try full volume first
+        for fill in fillings:
+            request = {
+                "action": self._mt5.TRADE_ACTION_DEAL,
+                "symbol": mt5_sym,
+                "volume": float(volume),
+                "type": order_type,
+                "price": price,
+                "sl": float(fixed_sl),
+                "tp": float(fixed_tp),
+                "deviation": 20,
+                "magic": self.magic,
+                "comment": comment,
+                "type_time": self._mt5.ORDER_TIME_GTC,
+                "type_filling": fill,
+            }
+            result = self._mt5.order_send(request)
+            if result is not None and result.retcode == self._mt5.TRADE_RETCODE_DONE:
+                log.info("market_order_filled", symbol=symbol, side=side, volume=volume, ticket=result.order, price=result.price)
+                return OrderResult(True, result.order, result.price, volume, result.comment, result.retcode)
+
+        # If full volume failed, try splitting into chunks
+        if volume > max_vol:
+            remaining = volume
+            total_filled = 0.0
+            last_result = None
+            while remaining > 0:
+                chunk = min(remaining, max_vol)
+                chunk = round(chunk / vol_step) * vol_step
+                if chunk <= 0:
+                    break
+                for fill in fillings:
+                    request = {
+                        "action": self._mt5.TRADE_ACTION_DEAL,
+                        "symbol": mt5_sym,
+                        "volume": float(chunk),
+                        "type": order_type,
+                        "price": price,
+                        "sl": float(fixed_sl),
+                        "tp": float(fixed_tp),
+                        "deviation": 20,
+                        "magic": self.magic,
+                        "comment": comment,
+                        "type_time": self._mt5.ORDER_TIME_GTC,
+                        "type_filling": fill,
+                    }
+                    result = self._mt5.order_send(request)
+                    if result is not None and result.retcode == self._mt5.TRADE_RETCODE_DONE:
+                        total_filled += chunk
+                        remaining -= chunk
+                        last_result = result
+                        break
+                else:
+                    break
+
+            if total_filled > 0:
+                return OrderResult(True, last_result.order if last_result else None, last_result.price if last_result else None, total_filled, f"Filled in chunks", last_result.retcode if last_result else 0)
+
         if result is None:
             return OrderResult(False, None, None, None, "order_send returned None", -1)
 
-        if result.retcode != self._mt5.TRADE_RETCODE_DONE:
-            log.error("market_order_failed", symbol=symbol, side=side, retcode=result.retcode, comment=result.comment)
-            return OrderResult(False, None, None, None, result.comment, result.retcode)
-
-        log.info("market_order_filled", symbol=symbol, side=side, volume=volume, ticket=result.order, price=result.price)
-        return OrderResult(True, result.order, result.price, volume, result.comment, result.retcode)
+        log.error("market_order_failed", symbol=symbol, side=side, retcode=result.retcode, comment=result.comment)
+        return OrderResult(False, None, None, None, result.comment, result.retcode)
 
     # ── Pending orders ────────────────────────────────────────────────────
 
@@ -540,7 +590,7 @@ class MT5TradingWrapper:
 
     # ── Close positions ────────────────────────────────────────────────────
 
-    def close_position(self, ticket: int) -> OrderResult:
+    def close_position(self, ticket: int, volume: float | None = None) -> OrderResult:
         """Close an open position by ticket."""
         if not self._connected:
             return OrderResult(False, None, None, None, "Not connected", -1)
@@ -559,27 +609,79 @@ class MT5TradingWrapper:
             return OrderResult(False, None, None, None, f"Tick not found for {mt5_sym}", -1)
 
         price = tick.bid if close_type == self._mt5.ORDER_TYPE_SELL else tick.ask
+        vol_to_close = volume if volume is not None else pos.volume
 
-        request = {
-            "action": self._mt5.TRADE_ACTION_DEAL,
-            "symbol": mt5_sym,
-            "volume": pos.volume,
-            "type": close_type,
-            "position": ticket,
-            "price": price,
-            "deviation": 20,
-            "magic": self.magic,
-            "comment": "AI close",
-            "type_time": self._mt5.ORDER_TIME_GTC,
-            "type_filling": self._mt5.ORDER_FILLING_IOC,
-        }
+        # Check symbol limits and split if needed
+        sym_info = self._mt5.symbol_info(mt5_sym)
+        max_vol = getattr(sym_info, "volume_max", vol_to_close) if sym_info else vol_to_close
+        vol_step = getattr(sym_info, "volume_step", 0.01) if sym_info else 0.01
 
-        result = self._mt5.order_send(request)
-        if result is None or result.retcode != self._mt5.TRADE_RETCODE_DONE:
-            return OrderResult(False, None, None, None, getattr(result, "comment", "unknown"), getattr(result, "retcode", -1))
+        # Round volume to valid step
+        vol_to_close = round(vol_to_close / vol_step) * vol_step
 
-        log.info("position_closed", ticket=ticket, symbol=mt5_sym, price=result.price)
-        return OrderResult(True, result.order, result.price, pos.volume, result.comment, result.retcode)
+        fillings = [
+            self._mt5.ORDER_FILLING_IOC,
+            self._mt5.ORDER_FILLING_FOK,
+            self._mt5.ORDER_FILLING_RETURN,
+        ]
+
+        # Try to close the full volume first
+        for fill in fillings:
+            request = {
+                "action": self._mt5.TRADE_ACTION_DEAL,
+                "symbol": mt5_sym,
+                "volume": vol_to_close,
+                "type": close_type,
+                "position": ticket,
+                "price": price,
+                "deviation": 20,
+                "magic": self.magic,
+                "comment": "AI close",
+                "type_time": self._mt5.ORDER_TIME_GTC,
+                "type_filling": fill,
+            }
+            result = self._mt5.order_send(request)
+            if result is not None and result.retcode == self._mt5.TRADE_RETCODE_DONE:
+                log.info("position_closed", ticket=ticket, symbol=mt5_sym, volume=vol_to_close, price=result.price)
+                return OrderResult(True, result.order, result.price, vol_to_close, result.comment, result.retcode)
+
+        # If full volume failed, try splitting into chunks
+        if vol_to_close > max_vol:
+            remaining = vol_to_close
+            total_closed = 0.0
+            last_result = None
+            while remaining > 0:
+                chunk = min(remaining, max_vol)
+                chunk = round(chunk / vol_step) * vol_step
+                if chunk <= 0:
+                    break
+                for fill in fillings:
+                    request = {
+                        "action": self._mt5.TRADE_ACTION_DEAL,
+                        "symbol": mt5_sym,
+                        "volume": chunk,
+                        "type": close_type,
+                        "position": ticket,
+                        "price": price,
+                        "deviation": 20,
+                        "magic": self.magic,
+                        "comment": "AI close",
+                        "type_time": self._mt5.ORDER_TIME_GTC,
+                        "type_filling": fill,
+                    }
+                    result = self._mt5.order_send(request)
+                    if result is not None and result.retcode == self._mt5.TRADE_RETCODE_DONE:
+                        total_closed += chunk
+                        remaining -= chunk
+                        last_result = result
+                        break
+                else:
+                    break
+
+            if total_closed > 0:
+                return OrderResult(True, last_result.order if last_result else None, last_result.price if last_result else None, total_closed, f"Closed in chunks", last_result.retcode if last_result else 0)
+
+        return OrderResult(False, None, None, None, getattr(result, "comment", "unknown"), getattr(result, "retcode", -1))
 
     def close_all_positions(self, symbol: str | None = None) -> list[OrderResult]:
         """Close all open positions (optionally filtered by symbol)."""

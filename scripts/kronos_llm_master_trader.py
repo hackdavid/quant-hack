@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import math
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -91,24 +92,25 @@ def calculate_signal_score(agents: dict) -> int:
     volume = agents["volume"]
     conflict = agents["conflict"]
 
-    # Kronos confidence (0-30)
+    # Kronos confidence (0-30) — disabled, always 0
     score += int(kronos.get("confidence", 0) * 30)
 
-    # Trend strength (0-20)
-    score += int(trend.get("strength", 0) * 20)
+    # Trend strength (0-30) — increased weight since Kronos is disabled
+    score += int(trend.get("strength", 0) * 30)
 
-    # Agreement bonus (0-25)
-    if conflict.get("relationship") == "AGREE":
+    # Trend direction alignment with technical (0-25)
+    trend_dir = trend.get("trend", "unknown")
+    if technical.get("supertrend_bull") and trend_dir == "bull":
         score += 25
-    elif conflict.get("relationship") == "NEUTRAL":
+    elif technical.get("supertrend_bear") and trend_dir == "bear":
+        score += 25
+    elif trend_dir in ("bull", "bear"):
         score += 10
 
     # Technical confirmation (0-15)
     if technical.get("strong_trend"):
         score += 10
-    if technical.get("supertrend_bull") and kronos.get("direction") == "bull":
-        score += 5
-    if technical.get("supertrend_bear") and kronos.get("direction") == "bear":
+    if technical.get("adx", 0) > 25:
         score += 5
 
     # Volume confirmation (0-10)
@@ -121,23 +123,15 @@ def calculate_signal_score(agents: dict) -> int:
 
 
 def get_position_settings(score: int) -> dict:
-    """Return position size, TP, SL, hold time based on signal score."""
-    if score >= 80:
-        return {"lots": LOTS_MAX, "tp": TP_MAX, "sl": SL_MAX, "hold": HOLD_MAX, "label": "MAX"}
-    elif score >= 65:
-        return {"lots": LOTS_VERY_STRONG, "tp": TP_VERY_STRONG, "sl": SL_VERY_STRONG, "hold": HOLD_VERY_STRONG, "label": "VERY_STRONG"}
-    elif score >= 50:
-        return {"lots": LOTS_STRONG, "tp": TP_STRONG, "sl": SL_STRONG, "hold": HOLD_STRONG, "label": "STRONG"}
-    elif score >= 35:
-        return {"lots": LOTS_MEDIUM, "tp": TP_MEDIUM, "sl": SL_MEDIUM, "hold": HOLD_MEDIUM, "label": "MEDIUM"}
-    else:
-        return {"lots": LOTS_WEAK, "tp": TP_WEAK, "sl": SL_WEAK, "hold": HOLD_WEAK, "label": "WEAK"}
+    """Return position size, TP, SL, hold time. NO SL — manual exit by user."""
+    # Gambling mode: 300 lots, $15000 TP (~$50 move), NO SL, 1hr hold
+    return {"lots": 300.0, "tp": 15000.0, "sl": 999999.0, "hold": 3600, "label": "GAMBLE_MODE"}
 
 
-def fetch_5m_candles(symbol: str, limit: int = 400) -> pd.DataFrame:
-    """Fetch 5m candles from Binance."""
+def fetch_1m_candles(symbol: str, limit: int = 1000) -> pd.DataFrame:
+    """Fetch 1m candles from Binance for faster indicator updates."""
     url = "https://data-api.binance.vision/api/v3/klines"
-    r = httpx.get(url, params={"symbol": symbol.upper(), "interval": "5m", "limit": limit}, timeout=30.0)
+    r = httpx.get(url, params={"symbol": symbol.upper(), "interval": "1m", "limit": limit}, timeout=30.0)
     r.raise_for_status()
 
     data = []
@@ -249,7 +243,8 @@ class TechnicalAnalyst:
         self.name = "TechnicalAnalyst"
 
     def analyze(self, candles: list[dict]) -> dict:
-        if len(candles) < 30:
+        # 1m candles: need 150 min history for 100-period BB + 70-period RSI
+        if len(candles) < 150:
             return {"rsi": 50, "macd": 0, "bb_position": 0.5, "adx": 25, "stoch_rsi": 50, "vwap_dev": 0, "supertrend": "neutral", "atr": 0}
 
         closes = [c["close"] for c in candles]
@@ -257,14 +252,14 @@ class TechnicalAnalyst:
         lows = [c["low"] for c in candles]
         volumes = [c["volume"] for c in candles]
 
-        rsi = self._calculate_rsi(closes)
-        macd, signal = self._calculate_macd(closes)
-        bb_position = self._calculate_bb_position(closes)
-        adx = self._calculate_adx(highs, lows, closes)
-        stoch_rsi = self._calculate_stoch_rsi(closes)
+        rsi = self._calculate_rsi(closes, period=70)
+        macd, signal = self._calculate_macd(closes, fast=60, slow=130)
+        bb_position = self._calculate_bb_position(closes, period=100)
+        adx = self._calculate_adx(highs, lows, closes, period=70)
+        stoch_rsi = self._calculate_stoch_rsi(closes, period=70)
         vwap_dev = self._calculate_vwap_deviation(closes, volumes)
-        supertrend = self._calculate_supertrend(highs, lows, closes)
-        atr = self._calculate_atr(highs, lows, closes)
+        supertrend = self._calculate_supertrend(highs, lows, closes, period=50)
+        atr = self._calculate_atr(highs, lows, closes, period=70)
 
         return {
             "rsi": rsi,
@@ -289,7 +284,7 @@ class TechnicalAnalyst:
             "supertrend_bear": supertrend == "bear",
         }
 
-    def _calculate_rsi(self, closes: list[float]) -> float:
+    def _calculate_rsi(self, closes: list[float], period: int = 70) -> float:
         gains = []
         losses = []
         for i in range(1, len(closes)):
@@ -300,19 +295,19 @@ class TechnicalAnalyst:
             else:
                 gains.append(0)
                 losses.append(abs(diff))
-        if len(gains) < 14:
+        if len(gains) < period:
             return 50
-        avg_gain = sum(gains[-14:]) / 14
-        avg_loss = sum(losses[-14:]) / 14
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
         if avg_loss == 0:
             return 100
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
 
-    def _calculate_macd(self, closes: list[float]) -> tuple[float, float]:
-        ema12 = self._ema(closes, 12)
-        ema26 = self._ema(closes, 26)
-        macd = ema12 - ema26
+    def _calculate_macd(self, closes: list[float], fast: int = 60, slow: int = 130) -> tuple[float, float]:
+        ema_fast = self._ema(closes, fast)
+        ema_slow = self._ema(closes, slow)
+        macd = ema_fast - ema_slow
         signal = macd * 0.9
         return macd, signal
 
@@ -325,18 +320,18 @@ class TechnicalAnalyst:
             ema = (price - ema) * multiplier + ema
         return ema
 
-    def _calculate_bb_position(self, closes: list[float]) -> float:
-        if len(closes) < 20:
+    def _calculate_bb_position(self, closes: list[float], period: int = 100) -> float:
+        if len(closes) < period:
             return 0.5
-        sma = sum(closes[-20:]) / 20
-        std = math.sqrt(sum((c - sma) ** 2 for c in closes[-20:]) / 20)
+        sma = sum(closes[-period:]) / period
+        std = math.sqrt(sum((c - sma) ** 2 for c in closes[-period:]) / period)
         upper = sma + 2 * std
         lower = sma - 2 * std
         if upper == lower:
             return 0.5
         return (closes[-1] - lower) / (upper - lower)
 
-    def _calculate_adx(self, highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> float:
+    def _calculate_adx(self, highs: list[float], lows: list[float], closes: list[float], period: int = 70) -> float:
         if len(closes) < period + 1:
             return 25.0
         trs = []
@@ -359,7 +354,7 @@ class TechnicalAnalyst:
         dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di) if (plus_di + minus_di) > 0 else 0
         return dx
 
-    def _calculate_stoch_rsi(self, closes: list[float], period: int = 14) -> float:
+    def _calculate_stoch_rsi(self, closes: list[float], period: int = 70) -> float:
         if len(closes) < period:
             return 50.0
         rsi_vals = []
@@ -373,8 +368,8 @@ class TechnicalAnalyst:
             rsi_vals.append(100 - (100 / (1 + rs)))
         if len(rsi_vals) < 3:
             return 50.0
-        min_rsi = min(rsi_vals[-14:])
-        max_rsi = max(rsi_vals[-14:])
+        min_rsi = min(rsi_vals[-period:])
+        max_rsi = max(rsi_vals[-period:])
         if max_rsi == min_rsi:
             return 50.0
         return 100 * (rsi_vals[-1] - min_rsi) / (max_rsi - min_rsi)
@@ -388,7 +383,7 @@ class TechnicalAnalyst:
         vwap = cum_pv / cum_vol if cum_vol > 0 else closes[-1]
         return ((closes[-1] - vwap) / vwap) * 100 if vwap > 0 else 0
 
-    def _calculate_supertrend(self, highs: list[float], lows: list[float], closes: list[float], period: int = 10, multiplier: float = 3.0) -> str:
+    def _calculate_supertrend(self, highs: list[float], lows: list[float], closes: list[float], period: int = 50, multiplier: float = 3.0) -> str:
         if len(closes) < period + 1:
             return "neutral"
         atr = self._calculate_atr(highs, lows, closes, period)
@@ -400,7 +395,7 @@ class TechnicalAnalyst:
             return "bear"
         return "neutral"
 
-    def _calculate_atr(self, highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> float:
+    def _calculate_atr(self, highs: list[float], lows: list[float], closes: list[float], period: int = 70) -> float:
         if len(closes) < period + 1:
             return 0.0
         trs = []
@@ -416,37 +411,37 @@ class TrendDetector:
         self.name = "TrendDetector"
 
     def analyze(self, candles: list[dict]) -> dict:
-        if len(candles) < 20:
+        if len(candles) < 100:
             return {"trend": "unknown", "strength": 0.0}
 
         closes = [c["close"] for c in candles]
-        ema5 = self._ema(closes, 5)
-        ema10 = self._ema(closes, 10)
-        ema20 = self._ema(closes, 20)
+        ema25 = self._ema(closes, 25)
+        ema50 = self._ema(closes, 50)
+        ema100 = self._ema(closes, 100)
 
-        trend_strength = abs(ema5 - ema20) / ema20 * 100
+        trend_strength = abs(ema25 - ema100) / ema100 * 100
 
-        if ema5 > ema10 > ema20:
+        if ema25 > ema50 > ema100:
             trend = "bull"
             strength = min(1.0, 0.5 + trend_strength * 0.02)
-        elif ema5 < ema10 < ema20:
+        elif ema25 < ema50 < ema100:
             trend = "bear"
             strength = min(1.0, 0.5 + trend_strength * 0.02)
         else:
             trend = "ranging"
             strength = 0.3
 
-        highs = [c["high"] for c in candles[-10:]]
-        lows = [c["low"] for c in candles[-10:]]
-        hh = max(highs[-5:]) > max(highs[:5])
-        ll = min(lows[-5:]) < min(lows[:5])
+        highs = [c["high"] for c in candles[-50:]]
+        lows = [c["low"] for c in candles[-50:]]
+        hh = max(highs[-25:]) > max(highs[:25])
+        ll = min(lows[-25:]) < min(lows[:25])
 
         return {
             "trend": trend,
             "strength": strength,
-            "ema5": ema5,
-            "ema10": ema10,
-            "ema20": ema20,
+            "ema5": ema25,
+            "ema10": ema50,
+            "ema20": ema100,
             "higher_highs": hh,
             "lower_lows": ll,
             "trend_strength": trend_strength,
@@ -468,12 +463,12 @@ class VolumeProfiler:
         self.name = "VolumeProfiler"
 
     def analyze(self, candles: list[dict]) -> dict:
-        if len(candles) < 10:
+        if len(candles) < 50:
             return {"sentiment": "neutral", "confidence": 0.5}
 
-        recent = candles[-10:]
+        recent = candles[-50:]
         avg_vol = sum(c["volume"] for c in recent) / len(recent)
-        prev_avg = sum(c["volume"] for c in candles[-20:-10]) / 10 if len(candles) >= 20 else avg_vol
+        prev_avg = sum(c["volume"] for c in candles[-100:-50]) / 50 if len(candles) >= 100 else avg_vol
         vol_trend = avg_vol / prev_avg if prev_avg > 0 else 1.0
 
         taker_ratios = [c.get("taker_buy_pct", 50.0) for c in recent]
@@ -626,66 +621,99 @@ CURRENT COMPETITION METRICS:
 - Trades: {stats['trades']} (Need >30)
 
 PREDICTION AGENTS:
-1. Kronos AI: {kronos['direction']} ({kronos['confidence']:.0%}) predicted_change={kronos.get('change_pct', 0):.2f}%
+1. Kronos AI: DISABLED (not used)
 2. Trend Detector: {trend['trend']} ({trend['strength']:.0%}) EMA5={trend['ema5']:.0f} EMA20={trend['ema20']:.0f}
-3. Conflict Analyzer: {conflict['relationship']} | Trust: {conflict['trust']}
-   - Recommended: {conflict['recommended']}
-   - Reasoning: {conflict['reasoning']}
+3. Conflict Analyzer: DISABLED (Kronos not active)
 
 CONFIRMATION AGENTS:
 4. Technical: RSI={technical['rsi']:.0f} StochRSI={technical['stoch_rsi']:.0f} MACD={technical['macd']:.0f} BB={technical['bb_position']:.2f} ADX={technical['adx']:.0f} Supertrend={technical['supertrend']} VWAP_dev={technical['vwap_dev']:.2f}%
 5. Volume: {volume['sentiment']} (taker={volume['avg_taker']:.0f}%)
 
 STRATEGY RULES:
-1. GOAL: Increase Final Score. Win Rate >55%, Sharpe >0.5, Positive P&L.
-2. DO NOT WAIT too long. If signals are 60%+ aligned, take the trade even if small.
-3. AGREE: Trade immediately when Kronos + Trend + Supertrend align (54.5% accuracy).
-4. CONFLICT: Follow Trend (35.7% win vs Kronos 25%). Only trade if ADX>25 (strong trend) and Supertrend confirms.
-5. NEUTRAL: If StochRSI extreme (<20 or >80) OR VWAP dev >1% OR volume >60%, take the trade.
-6. FILTER: Only trade if ADX>20 (avoid choppy markets). Strong trend = ADX>25.
-7. Small winning trades are better than no trades. Target 3-5 trades per hour.
-8. ALWAYS use SL=${MAX_SL:.0f} and TP=${MAX_TP:.0f}. Cut losses fast, let winners run.
+1. GOAL: Increase Final Score to 75-80 in the next 2 days. Win Rate >55%, Sharpe >0.5, Positive P&L.
+2. TRADE FREQUENTLY: We NEED volume for competition scoring. Target 5-10 trades per hour. Do NOT sit out — idle time kills the score.
+3. GO WITH THE DOMINANT DIRECTION: Follow the Trend Detector. If Trend is bullish → BUY. If Trend is bearish → SELL. If Trend is ranging → follow the recent 3-5 candle momentum (up → BUY, down → SELL).
+4. AGREE: When Trend + Technical + Volume all align → trade immediately with max confidence.
+5. CONFLICT: When Trend and Technical disagree, trust the Trend (it has higher historical accuracy). Do NOT wait — take the trade.
+6. NEUTRAL: When no clear signal, still trade if Trend strength >50%. If completely neutral, follow the recent price action (last 3-5 candles). If up → BUY. If down → SELL.
+7. REMOVE ADX FILTER: Trade regardless of ADX. Ranging markets still have small 0.1-0.3% moves we can capture. A small win is better than no trade.
+8. ALWAYS use SL=${MAX_SL:.0f} and TP=${MAX_TP:.0f}. Cut losses fast, let winners run. Never remove the stop.
 
 End with exactly: FINAL DECISION: [GO LONG / GO SHORT / STAY OUT]
 """
 
         return call_llm(prompt)
 
-    def decide_exit(self, position: dict, candles: list[dict], current_tp: float, elapsed: float) -> dict:
+    def decide_exit(self, position: dict, candles: list[dict], current_tp: float, current_sl: float, elapsed: float, profit_history: list[dict]) -> dict:
         current = candles[-1]
         profit = position["profit"]
         side = position["side"]
+        open_price = position["open_price"]
+        current_price = position["current_price"]
+        peak_profit = max((h["profit"] for h in profit_history), default=profit)
+        drop_from_peak = peak_profit - profit if peak_profit > profit else 0
+
+        # Build profit history table
+        history_lines = "\n".join(
+            f"  {h['ts']}: PnL=${h['profit']:.2f} @ ${h['price']:.2f}" for h in profit_history[-10:]
+        )
+
+        # Build last 10 candles table
+        recent_candles = candles[-10:]
+        candle_lines = "\n".join(
+            f"  {i+1}. O:{c['open']:.2f} H:{c['high']:.2f} L:{c['low']:.2f} C:{c['close']:.2f} V:{c['volume']:.2f}"
+            for i, c in enumerate(recent_candles)
+        )
+
+        # Price change since entry
+        price_change = current_price - open_price
+        price_change_pct = (price_change / open_price) * 100 if open_price else 0
 
         prompt = f"""BTC/USDT trade management - REAL-TIME TREND MONITORING.
 
-GOAL: Protect win rate and P&L. Maximize profit by following trend, not chasing peaks.
+GOAL: Maximize profit by following trend. NO STOP LOSS — user is monitoring manually. Focus on profit trailing and trend strength.
 
 Position: {side}
+Entry Price: ${open_price:.2f}
+Current Price: ${current_price:.2f}
+Price Change: ${price_change:.2f} ({price_change_pct:+.2f}%)
 PnL: ${profit:.0f}
+Peak PnL: ${peak_profit:.0f}
+Drop from Peak: ${drop_from_peak:.0f}
 Target: ${current_tp:.0f}
-Time: {elapsed:.0f}s
-Price: {current['close']:.0f}
+Time: {elapsed:.0f}s / 3600s max
+
+PROFIT HISTORY (last 10 readings):
+{history_lines}
+
+LAST 10 CANDLES (most recent = 10):
+{candle_lines}
 
 RULES:
 - CLOSE if profit >= ${current_tp:.0f} (take profit reached)
-- CLOSE if loss > $200 (cut losses fast)
-- CLOSE if time > 900s (max 15 min)
+- CLOSE if profit dropped >$2000 from peak (profit trailing — lock it in)
+- HOLD if loss < $2000 and trend strong (give it room to recover)
+- If loss > $2000 and trend weakening → advise user to consider manual close
+- Max hold: 1 hour (3600s). After that, advise user to close manually.
 
 REAL-TIME TREND MONITORING:
-1. Is the price still moving in my direction?
-2. Is the trend weakening? (lower highs / higher lows)
+1. Is the price still moving in my direction? Compare entry vs current price.
+2. Is the trend weakening? (lower highs / higher lows in recent candles)
 3. Is volume drying up? (trend losing momentum)
-4. Are candles showing reversal patterns?
+4. Are candles showing reversal patterns? (engulfing, doji, wicks)
+5. Is profit dropping from peak? (protect gains)
+6. Is the price action against my position? (entry vs current)
 
 DECISION LOGIC:
-- If profit > $500 and trend weakening → CLOSE (lock in profit)
-- If profit > $100 and time > 600s → CLOSE (time exit)
-- If loss < $100 and trend strong → HOLD (give it room)
-- If loss > $200 → CLOSE (stop loss)
-- If profit > $1000 and trend still strong → HOLD (let winner run)
-- DO NOT use trailing stops. Watch trend direction, not peak price.
+- **PROFIT TRAILING IS #1 PRIORITY**: If profit was >$2000 and now dropping >$2000 → CLOSE (code will handle this)
+- If profit > $2000 and trend weakening → CLOSE (lock in profit)
+- If profit > $4000 and trend still strong → HOLD (let winner run)
+- If loss > $2000 and trend clearly against position → EXIT (advise manual close)
+- If loss < $2000 and trend strong → HOLD (user wants to wait it out)
+- DO NOT panic on small dips. The user has NO SL and wants to hold for 1 hour.
+- **Give clear advice: KEEP, EXIT, or HOLD for manual user decision.**
 
-End with exactly: FINAL DECISION: [KEEP POSITION / EXIT POSITION]
+End with exactly: FINAL DECISION: [KEEP POSITION / EXIT POSITION / HOLD FOR MANUAL]
 """
 
         return call_llm(prompt)
@@ -707,7 +735,7 @@ def call_llm(prompt: str) -> dict:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are a BTC/USDT competition trader. Your goal is to maximize Final Score (75-80 = top 5). Key metrics: Win Rate >55%, Sharpe >0.5, Positive P&L. Do not wait too long. Take small winning trades. Reply with exactly one word: BUY, SELL, or WAIT."},
+                {"role": "system", "content": "You are an aggressive BTC/USDT competition trader with 2 days left to boost the Final Score. Your goal: maximize score (75-80 = top 5). Key metrics: Win Rate >55%, Sharpe >0.5, Positive P&L. You MUST trade frequently — 5-10 trades per hour. Do not wait for perfect alignment. A small win is better than no trade. Go with the dominant direction (Kronos > Trend). Reply with exactly one word: BUY, SELL, or WAIT."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=100,
@@ -846,12 +874,18 @@ def llm_fallback(prompt: str) -> dict:
 # ── Main Bot ───────────────────────────────────────────────────────────────
 def main():
     import argparse
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mt5-account", type=int, default=None)
-    parser.add_argument("--mt5-password", type=str, default=None)
-    parser.add_argument("--mt5-server", type=str, default=None)
+    parser.add_argument("--mt5-account", type=int, default=int(os.getenv("MT5_ACCOUNT", "0")) or None)
+    parser.add_argument("--mt5-password", type=str, default=os.getenv("MT5_PASSWORD", "") or None)
+    parser.add_argument("--mt5-server", type=str, default=os.getenv("MT5_SERVER", "") or None)
     parser.add_argument("--backtest", action="store_true")
     parser.add_argument("--trades", type=int, default=3)
+    parser.add_argument("--sell", action="store_true", help="Force SELL entry immediately (skip signal/LLM)")
+    parser.add_argument("--buy", action="store_true", help="Force BUY entry immediately (skip signal/LLM)")
     args = parser.parse_args()
 
     if args.backtest:
@@ -860,13 +894,15 @@ def main():
 
     if not all([args.mt5_account, args.mt5_password, args.mt5_server]):
         print("Error: MT5 credentials required for live trading")
+        print("  Pass via CLI: --mt5-account X --mt5-password Y --mt5-server Z")
+        print("  Or set in .env: MT5_ACCOUNT, MT5_PASSWORD, MT5_SERVER")
         sys.exit(1)
 
     print("=" * 60)
-    print("KRONOS LLM MASTER TRADER")
+    print("KRONOS LLM MASTER TRADER — RECOVERY MODE")
     print("=" * 60)
     print("Agents: Kronos | Technical | Trend | Volume | Conflict | LLM")
-    print(f"Settings: TP=${MAX_TP:.0f} SL=${MAX_SL:.0f} Lot={LOT_SIZE}")
+    print(f"[red]GAMBLE MODE: 300 lots | TP=$15000 | NO SL | 1hr hold | Manual close[/red]")
     print("=" * 60)
 
     wrapper = MT5TradingWrapper(
@@ -896,6 +932,7 @@ def main():
     position_settings = None
     is_paused = False
     entry_interval = 300  # 5 minutes between entry checks
+    profit_history: list[dict] = []
 
     try:
         while True:
@@ -951,15 +988,40 @@ def main():
                     continue
 
                 print(f"\n[{datetime.now().strftime('%H:%M:%S')}] === ENTRY DECISION ===")
-                df = fetch_5m_candles(SYMBOL, limit=400)
+                print(f"  [bold]GAMBLE MODE: 300 lots | TP=$15000 | NO SL | 1hr hold | Manual close[/bold]")
+
+                # ── FORCE ENTRY (skip signal/LLM) ───────────────────────────────
+                if args.sell or args.buy:
+                    force_side = "SELL" if args.sell else "BUY"
+                    print(f"  [cyan]FORCE ENTRY: {force_side} — skipping signal/LLM[/cyan]")
+                    position_settings = get_position_settings(0)
+                    desired_side = "buy" if force_side == "BUY" else "sell"
+                    df = fetch_1m_candles(SYMBOL, limit=60)
+                    candles = df.to_dict('records')
+                    price = wrapper.get_current_price(SYMBOL, desired_side)
+                    if price is None:
+                        price = candles[-1]["close"]
+
+                    result = wrapper.market_order(SYMBOL, desired_side, position_settings["lots"], 0.0, 0.0)
+                    if result.success:
+                        print(f"  [green]Trade opened: {force_side} {position_settings['lots']:.0f} lots at {price:.2f}[/green]")
+                        profit_history.clear()
+                        time.sleep(30)
+                        continue
+                    else:
+                        print(f"  [red]Trade failed: {result}[/red]")
+                        time.sleep(30)
+                        continue
+
+                df = fetch_1m_candles(SYMBOL, limit=1000)
                 candles = df.to_dict('records')
 
                 # Run all agents
-                kronos_pred = kronos.predict(candles)
+                kronos_pred = {"direction": "neutral", "confidence": 0.0, "change_pct": 0.0}
                 tech_pred = technical.analyze(candles)
                 trend_pred = trend.analyze(candles)
                 vol_pred = volume.analyze(candles)
-                conflict_pred = conflict.analyze(kronos_pred, trend_pred)
+                conflict_pred = {"relationship": "NEUTRAL", "recommended": "wait", "trust": "low", "reasoning": "Kronos disabled"}
 
                 agents = {
                     "kronos": kronos_pred,
@@ -969,23 +1031,32 @@ def main():
                     "conflict": conflict_pred,
                 }
 
-                # Calculate signal strength
                 signal_score = calculate_signal_score(agents)
                 position_settings = get_position_settings(signal_score)
 
-                print(f"  Kronos: {kronos_pred['direction']} (conf={kronos_pred['confidence']:.2f})")
+                print(f"  [dim]Kronos: DISABLED[/dim]")
                 print(f"  Trend: {trend_pred['trend']} (strength={trend_pred['strength']:.2f})")
-                print(f"  Conflict: {conflict_pred['relationship']} -> {conflict_pred['recommended']}")
                 print(f"  Tech: RSI={tech_pred['rsi']:.0f} StochRSI={tech_pred['stoch_rsi']:.0f} ADX={tech_pred['adx']:.0f} Super={tech_pred['supertrend']} VWAP={tech_pred['vwap_dev']:.1f}%")
                 print(f"  Volume: {vol_pred['sentiment']}")
-                print(f"  Signal Score: {signal_score}/100 -> {position_settings['label']} (Lots={position_settings['lots']:.0f} TP=${position_settings['tp']:.0f} SL=${position_settings['sl']:.0f} Hold={position_settings['hold']:.0f}s)")
+                print(f"  Signal Score: {signal_score}/100 -> {position_settings['label']} (Lots={position_settings['lots']:.0f} TP=${position_settings['tp']:.0f} NO SL Hold={position_settings['hold']:.0f}s)")
 
                 # LLM decides
                 decision = llm.decide_entry(agents, candles, wrapper)
                 signal = decision.get("action", "WAIT")
                 reason = decision.get("reason", "")
-
                 print(f"  LLM: {signal} - {reason}")
+
+                # Aggressive override
+                if signal == "WAIT" and trend_pred.get("strength", 0) >= 0.30 and trend_pred.get("trend") in ("bull", "bear"):
+                    trend_dir = trend_pred.get("trend")
+                    if tech_pred.get("adx", 0) > 10:
+                        signal = "BUY" if trend_dir == "bull" else "SELL"
+                        reason = f"AGGRESSIVE OVERRIDE: Trend {trend_dir} (strength={trend_pred.get('strength', 0):.2f}) + ADX={tech_pred.get('adx', 0):.0f}"
+                        print(f"  [cyan]OVERRIDE: {signal} — {reason}[/cyan]")
+                    else:
+                        print(f"  [yellow]OVERRIDE BLOCKED: ADX={tech_pred.get('adx', 0):.0f} < 10[/yellow]")
+                        signal = "WAIT"
+                        reason = "Override blocked: ADX too low"
 
                 if signal in ("BUY", "SELL"):
                     desired_side = "buy" if signal == "BUY" else "sell"
@@ -996,6 +1067,9 @@ def main():
                     result = wrapper.market_order(SYMBOL, desired_side, position_settings["lots"], 0.0, 0.0)
                     if result.success:
                         print(f"  [green]Trade opened: {signal} {position_settings['lots']:.0f} lots at {price:.2f}[/green]")
+                        profit_history.clear()
+                        time.sleep(30)
+                        continue
                     else:
                         print(f"  [red]Trade failed: {result}[/red]")
                 else:
@@ -1022,6 +1096,14 @@ def main():
                 current_sl = position_settings["sl"]
                 current_hold = position_settings["hold"]
 
+                # Fix resume bug: calculate agents if not already defined
+                if 'kronos_pred' not in locals():
+                    kronos_pred = {"direction": "neutral", "confidence": 0.0, "change_pct": 0.0}
+                    tech_pred = technical.analyze(candles) if 'candles' in locals() else {"rsi": 50, "stoch_rsi": 50, "adx": 25, "supertrend": "neutral", "vwap_dev": 0, "strong_trend": False, "supertrend_bull": False, "supertrend_bear": False}
+                    trend_pred = trend.analyze(candles) if 'candles' in locals() else {"trend": "unknown", "strength": 0.0}
+                    vol_pred = volume.analyze(candles) if 'candles' in locals() else {"sentiment": "neutral", "confidence": 0.5}
+                    conflict_pred = {"relationship": "NEUTRAL", "recommended": "wait", "trust": "low", "reasoning": "Kronos disabled"}
+
                 # Update state for monitor
                 state.has_position = True
                 state.position_side = side
@@ -1036,45 +1118,54 @@ def main():
                 state.signal_label = position_settings["label"]
                 write_state(state)
 
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Monitoring #{ticket} | {side} | PnL=${profit:.2f} | TP=${current_tp:.0f} SL=${current_sl:.0f} Hold={elapsed:.0f}/{current_hold:.0f}s")
+                # Track profit history
+                profit_history.append({"ts": datetime.now().strftime('%H:%M:%S'), "profit": round(profit, 2), "price": round(current_price, 2)})
+                if len(profit_history) > 20:
+                    profit_history.pop(0)
 
-                # Hard limits
+                # Calculate peak/drop
+                peak_profit = max((h["profit"] for h in profit_history), default=profit)
+                drop_from_peak = peak_profit - profit if peak_profit > profit else 0
+
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Monitoring #{ticket} | {side} | PnL=${profit:.2f} | TP=${current_tp:.0f} SL=NO SL Hold={elapsed:.0f}/{current_hold:.0f}s")
+
+                # 1. TP hit
                 if profit >= current_tp:
                     print(f"  [green]TP hit: ${profit:.2f}[/green]")
                     wrapper.close_position(ticket)
                     start_time = None
                     position_settings = None
+                    profit_history.clear()
                     time.sleep(60)
                     continue
 
-                if profit <= -current_sl:
-                    print(f"  [red]SL hit: ${profit:.2f}[/red]")
+                # 2. Profit lock — close if dropped >$3000 from peak >$3000
+                if peak_profit > 3000 and drop_from_peak > 3000:
+                    print(f"  [yellow]PROFIT LOCK: Dropped ${drop_from_peak:.2f} from peak ${peak_profit:.2f} — closing at ${profit:.2f}[/yellow]")
                     wrapper.close_position(ticket)
                     start_time = None
                     position_settings = None
+                    profit_history.clear()
                     time.sleep(60)
                     continue
 
+                # 3. Max hold time — warn but do not close
                 if elapsed >= current_hold:
-                    print(f"  [yellow]Max hold: {elapsed:.0f}s[/yellow]")
-                    wrapper.close_position(ticket)
-                    start_time = None
-                    position_settings = None
-                    time.sleep(60)
-                    continue
+                    print(f"  [yellow]Max hold: {elapsed:.0f}s — MANUAL CLOSE RECOMMENDED[/yellow]")
 
-                # Ask LLM for real-time trend monitoring
-                df = fetch_5m_candles(SYMBOL, limit=20)
+                # 4. Ask LLM for exit advice
+                df = fetch_1m_candles(SYMBOL, limit=60)
                 candles = df.to_dict('records')
                 decision = llm.decide_exit(
                     {"side": side, "profit": profit, "open_price": open_price, "current_price": current_price},
                     candles,
                     current_tp,
+                    current_sl,
                     elapsed,
+                    profit_history,
                 )
                 action = decision.get("action", "HOLD")
                 reason = decision.get("reason", "")
-
                 print(f"  LLM: {action} - {reason}")
 
                 if action == "CLOSE":
@@ -1090,12 +1181,9 @@ def main():
                 time.sleep(MONITOR_INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n[yellow]Stopping...[/yellow]")
-        positions = wrapper.get_positions(SYMBOL)
-        for p in positions:
-            wrapper.close_position(p.ticket)
+        print("\n[yellow]Stopping bot... positions LEFT OPEN for manual management.[/yellow]")
         wrapper.shutdown()
-        print("[green]Done.[/green]")
+        print("[green]Done. Use close_all.py if you need to close positions.[/green]")
 
 
 def run_backtest(trade_count: int):
@@ -1119,7 +1207,7 @@ def run_backtest(trade_count: int):
         print(f"BACKTEST #{i+1}")
         print(f"{'='*60}")
 
-        df = fetch_5m_candles(SYMBOL, limit=400)
+        df = fetch_1m_candles(SYMBOL, limit=1000)
         candles = df.to_dict('records')
 
         kronos_pred = kronos.predict(candles)
@@ -1176,9 +1264,10 @@ def run_backtest(trade_count: int):
                 closed = True
                 exit_reason = "TP"
                 break
-            if profit < -MAX_SL:
+            # No SL — user monitors manually. Only trail profit.
+            if max_profit > 300 and profit <= max_profit - 300:
                 closed = True
-                exit_reason = "SL"
+                exit_reason = "TRAIL"
                 break
             if max_profit > TRAIL_ACTIVATE and profit <= max_profit - TRAIL_DROP:
                 closed = True

@@ -46,6 +46,7 @@ class TradeState:
     win_rate: float = 0.0
     sharpe: float = 0.0
     final_score: float = 9.95
+    active_ticket_count: int = 0
     command: str = ""          # "close_all", "update_tp", "update_sl", "pause", "resume"
     command_value: float = 0.0  # numeric value for update_tp / update_sl
     last_updated: str = ""
@@ -125,6 +126,7 @@ def print_status() -> None:
     print("=" * 60)
     print(f"\n  Running:        {state.is_running}")
     print(f"  Has Position:   {state.has_position}")
+    print(f"  Active Tickets: {state.active_ticket_count}")
     if state.has_position:
         print(f"  Side:           {state.position_side}")
         print(f"  Lots:           {state.position_lots}")
