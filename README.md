@@ -176,21 +176,6 @@ Most trading bots use 5m or 15m candles. Kronos uses **1m candles** for:
 
 ---
 
-## 📊 Performance
-
-### Competition Results
-
-| Metric | Value |
-|--------|-------|
-| **Final Score** | 61.63 / 100 |
-| **Win Rate** | 54.9% |
-| **Sharpe Ratio** | 0.08 |
-| **Max Drawdown** | 0.59% |
-| **Total P&L** | +$3,697 |
-| **Trades** | 235 |
-| **Wins** | 129 |
-| **Losses** | 106 |
-
 ### Live Trading Example
 
 ```
