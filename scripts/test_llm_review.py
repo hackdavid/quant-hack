@@ -15,6 +15,9 @@ import os
 import sys
 
 from rich import print as rprint
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Ensure src is on path
 sys.path.insert(0, str(os.path.dirname(__file__) + "/../src"))
@@ -55,9 +58,9 @@ def main() -> None:
     rprint(json.dumps(review.to_dict(), indent=2))
 
     if review.risk_approved:
-        rprint("\n[green]✓ Risk approved[/green]")
+        rprint("\n[green]OK Risk approved[/green]")
     else:
-        rprint("\n[red]✗ Risk rejected[/red]")
+        rprint("\n[red]X Risk rejected[/red]")
 
 
 if __name__ == "__main__":

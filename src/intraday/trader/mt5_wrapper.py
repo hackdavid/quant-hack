@@ -195,7 +195,29 @@ class MT5TradingWrapper:
     # ── Connection lifecycle ──────────────────────────────────────────────
 
     def connect(self) -> bool:
-        """Initialize MT5 and log in. Returns True on success."""
+        """Initialize MT5 and log in. Returns True on success.
+
+        Avoids re-login if already connected to prevent MT5 disabling AutoTrading.
+        """
+        # ── Strategy 1: terminal already running and connected ──
+        try:
+            # If terminal_info() works, MT5 is already initialized
+            tinfo = self._mt5.terminal_info()
+            if tinfo is not None:
+                info = self._mt5.account_info()
+                if info is not None and info.login == self.account_id:
+                    self._connected = True
+                    log.info(
+                        "mt5_already_connected",
+                        server=self.server,
+                        account=self.account_id,
+                        balance=info.balance,
+                    )
+                    return True
+        except Exception:
+            pass  # Not initialized yet, proceed with full connect
+
+        # ── Strategy 2: full connect (first run) ──
         init_kwargs: dict[str, Any] = {}
         if self.path:
             init_kwargs["path"] = self.path
@@ -205,6 +227,24 @@ class MT5TradingWrapper:
             log.error("mt5_init_failed", error=err)
             return False
 
+        # After initialize(), check if we're already logged in
+        # This avoids re-login which disables AutoTrading
+        try:
+            info = self._mt5.account_info()
+            if info is not None and info.login == self.account_id:
+                self._connected = True
+                log.info(
+                    "mt5_connected_no_login",
+                    server=self.server,
+                    account=self.account_id,
+                    balance=info.balance,
+                    reason="already_logged_in",
+                )
+                return True
+        except Exception:
+            pass
+
+        # Only login if not already logged in
         login_ok = self._mt5.login(
             login=self.account_id,
             password=self.password,
@@ -311,6 +351,28 @@ class MT5TradingWrapper:
         """Sum of profit for all open positions."""
         return sum(p.profit for p in self.get_positions(symbol))
 
+    def get_current_price(self, symbol: str, side: str) -> float | None:
+        """Get current tick price for a symbol."""
+        if not self._connected:
+            return None
+        mt5_sym = self.to_mt5_symbol(symbol)
+        tick = self._mt5.symbol_info_tick(mt5_sym)
+        if tick is None:
+            return None
+        return float(tick.ask if side.lower() == "buy" else tick.bid)
+
+    def get_min_stop_distance(self, symbol: str) -> float:
+        """Get minimum stop distance for a symbol (price units)."""
+        if not self._connected:
+            return 0.03
+        mt5_sym = self.to_mt5_symbol(symbol)
+        info = self._mt5.symbol_info(mt5_sym)
+        if info is None:
+            return 0.03
+        point = info.point
+        trade_stops_level = info.trade_stops_level
+        return max(trade_stops_level * point, 30 * point, 0.03)
+
     # ── Market orders ─────────────────────────────────────────────────────
 
     def market_order(
@@ -343,6 +405,30 @@ class MT5TradingWrapper:
             self._mt5.ORDER_TYPE_BUY if side.lower() == "buy" else self._mt5.ORDER_TYPE_SELL
         )
         price = tick.ask if order_type == self._mt5.ORDER_TYPE_BUY else tick.bid
+        info = self._mt5.symbol_info(mt5_sym)
+        point = info.point if info else 0.001
+        trade_stops_level = info.trade_stops_level if info else 30
+        # Use broker's actual trade_stops_level, not hardcoded 30
+        min_distance = max(trade_stops_level * point, 30 * point, 0.03)
+        log.info("mt5_symbol_info", symbol=mt5_sym, point=point, trade_stops_level=trade_stops_level, min_distance=min_distance)
+
+        # Fix SL/TP against the ACTUAL tick price (not candle close)
+        fixed_sl = sl
+        fixed_tp = tp
+        if side.lower() == "buy":
+            if sl > 0 and sl >= price - min_distance:
+                fixed_sl = round(price - min_distance * 2, 3)
+                log.info("sl_adjusted_tick", symbol=symbol, price=price, old_sl=sl, new_sl=fixed_sl, min_distance=min_distance)
+            if tp > 0 and tp <= price + min_distance:
+                fixed_tp = round(price + min_distance * 2, 3)
+                log.info("tp_adjusted_tick", symbol=symbol, price=price, old_tp=tp, new_tp=fixed_tp, min_distance=min_distance)
+        else:
+            if sl > 0 and sl <= price + min_distance:
+                fixed_sl = round(price + min_distance * 2, 3)
+                log.info("sl_adjusted_tick", symbol=symbol, price=price, old_sl=sl, new_sl=fixed_sl, min_distance=min_distance)
+            if tp > 0 and tp >= price - min_distance:
+                fixed_tp = round(price - min_distance * 2, 3)
+                log.info("tp_adjusted_tick", symbol=symbol, price=price, old_tp=tp, new_tp=fixed_tp, min_distance=min_distance)
 
         request = {
             "action": self._mt5.TRADE_ACTION_DEAL,
@@ -350,8 +436,8 @@ class MT5TradingWrapper:
             "volume": float(volume),
             "type": order_type,
             "price": price,
-            "sl": float(sl),
-            "tp": float(tp),
+            "sl": float(fixed_sl),
+            "tp": float(fixed_tp),
             "deviation": 20,
             "magic": self.magic,
             "comment": comment,

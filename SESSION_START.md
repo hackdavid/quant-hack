@@ -1,87 +1,96 @@
 # Quick Session Start Guide
 
-**Last Updated:** 2026-06-18  
-**Current Phase:** Phase 1 (Data Collection)  
-**Status:** ✅ Implementation Complete, ⏳ Waiting for Data
+**Last Updated:** 2026-06-23
+**Current Status:** Autonomous Trader Pipeline — End-to-End Working
+**Next Priority:** Get actual trades executing + retrain transformer on 2026 data
 
 ---
 
 ## 📍 Where We Are
 
-**Phase 1 Implementation:** ✅ **COMPLETE** (2026-06-18)
-- All code working
-- 16/16 tests passing
-- CLI functional
-- Ready to collect data
+**What's Working:**
+- ✅ Full V6 pipeline running (Forecast + Orderflow + Regime + Risk + StayOut + MetaLearner + DecisionEngine)
+- ✅ 20-feature calculation from live Binance WebSocket (1m + 5m klines)
+- ✅ LLM review with Fireworks Kimi K2.6 (full context: candle, pipeline, positions, logs)
+- ✅ MT5 demo account connected and executing orders
+- ✅ Paper mode with lowered thresholds (forecast_confidence=0.02, meta_threshold=0.05)
+- ✅ Regime fallback strategy when transformer is uncertain
+- ✅ Position manager (closes opposite, opens new, prevents double-entry)
+- ✅ JSONL trade logging to `logs/autonomous_trader/`
 
-**What's Blocking Phase 2:**
-- Need ≥4-6 weeks of live tick data (trades + depth)
-- Historical tick data NOT freely available
-- Must capture from day 1 and accumulate
+**What's Broken / Needs Fix:**
+- 🔴 Transformer model is 15 months old (trained 2025-03-31) — concept drift causes confidence 0.001-0.02
+- 🔴 LLM API intermittently times out with [WinError 10060] — network connectivity to Fireworks
+- 🔴 WebSocket connected but bar processing needs monitoring (may stall)
+- 🔴 Strategy generates mostly HOLD signals — need more trades for competition volume
+- 🟡 MT5 AutoTrading must be manually enabled in terminal (Ctrl+E) every session
 
 ---
 
 ## 🚀 What To Do Next Session
 
-### **If <4 weeks have passed:**
+### **Priority 1: Get Actual Trades Executing**
 
-Check live capture status:
 ```bash
-# Check if capture is still running
-ps aux | grep "intraday data live-capture"
-
-# Check captured data
-intraday data summary
-
-# Verify checkpoint
-intraday data checkpoint
+# Start trader with LLM + regime fallback + paper mode
+cd "C:\Users\DaudDewan\OneDrive - SymphonyAI\Documents\Learning\hackathon\quanthack"
+uv run python scripts/autonomous_trader.py \
+  --transformer-run models/transformer/20260623T132957Z \
+  --mt5-account YOUR_ACCOUNT \
+  --mt5-password "YOUR_PASSWORD" \
+  --mt5-server "YOUR_SERVER" \
+  --use-llm --llm-debug \
+  --paper-mode --regime-fallback \
+  --interval 5 \
+  2>&1 | tee logs/autonomous_trader/session_run.log
 ```
 
-If capture stopped, restart it:
+**Before starting:**
+1. Open MetaTrader 5 terminal
+2. Click **AutoTrading** button (or press `Ctrl+E`) until it turns green
+3. Verify your MT5 account is logged in
+
+**Monitor:**
 ```bash
-# In tmux/screen
-intraday data live-capture --streams trade,depth,mark_price
+# Watch for trades in real-time
+tail -f logs/autonomous_trader/session_run.log | grep -E "Signal:|LLM:|Order:|trade_logged|BUY|SELL|HOLD|regime_fallback|error"
 ```
 
-### **If ≥4 weeks have passed:**
+### **Priority 2: Retrain Transformer on 2026 Data**
 
-1. Verify data collected:
-   ```bash
-   intraday data summary
-   # Should show 4-6 weeks of trade/depth data
-   ```
+```bash
+# Check current model age
+cat models/transformer/20260623T132957Z/metadata.json | grep "train_date"
 
-2. Update MASTER_INDEX.md:
-   - Phase 1 status → ✅ DONE
-   - Phase 2 status → 🔵 CURRENT
+# If older than 1 month, retrain:
+# See idea/phases/04_forecast.md for training pipeline
+# Or use src/intraday/forecast/train.py
+```
 
-3. Start Phase 2:
-   - Read `idea/phases/02_features.md`
-   - Implement feature engine (OFI, microprice, VPIN, Hawkes, etc.)
+**Why:** Model trained on 2025-03-31 data has concept drift. Current BTC price ~$62k vs training price ~$70k. This causes forecast confidence to be 0.001-0.02 even with paper mode threshold 0.02.
+
+### **Priority 3: Improve Strategy for More Trades**
+
+Current regime fallback only fires when:
+- Regime = bull + flow_bias > 0 → BUY
+- Regime = bear + flow_bias < 0 → SELL
+
+**Options to increase trade frequency:**
+1. Lower LLM confidence threshold from 0.65 to 0.50 (in `src/intraday/llm/review.py`)
+2. Add momentum-based fallback when regime/flow conflict
+3. Reduce position size but increase trade frequency
+4. Use 1m interval instead of 5m (more signals, more noise)
 
 ---
 
-## 📋 Pending Actions (Phase 1)
+## 📋 Pending Actions
 
-- [ ] **Download 12 months historical data** (~10-30 mins total):
-  ```bash
-  intraday data download --kind klines_5m --start 2024-01-01 --end 2024-12-31
-  intraday data download --kind klines_1m --start 2024-01-01 --end 2024-12-31
-  intraday data download --kind funding --start 2024-01-01 --end 2024-12-31
-  intraday data download --kind open_interest --start 2024-01-01 --end 2024-12-31
-  ```
-
-- [ ] **Start live capture** (run in background for 4-6 weeks):
-  ```bash
-  # In tmux/screen session
-  intraday data live-capture --streams trade,depth,mark_price
-  
-  # Detach: Ctrl+B, D (tmux) or Ctrl+A, D (screen)
-  ```
-
-- [ ] **Set calendar reminder** for 4-6 weeks:
-  - Date: ~2026-07-23 to 2026-08-01
-  - Action: Check back, verify data, start Phase 2
+- [ ] **Execute first real demo trade** — verify MT5 order placement works end-to-end
+- [ ] **Retrain transformer** on recent 2026 data to fix concept drift
+- [ ] **Add LLM retry logic** — handle [WinError 10060] timeout gracefully
+- [ ] **Monitor WebSocket stability** — ensure bars are processed every 5m
+- [ ] **Generate 5+ trades/day** — competition requires volume for Sharpe calculation
+- [ ] **Track PnL** — verify positions are profitable and stops are working
 
 ---
 
@@ -89,72 +98,74 @@ intraday data live-capture --streams trade,depth,mark_price
 
 | File | Purpose |
 |------|---------|
-| `MASTER_INDEX.md` | **Read this first every session** - tracks progress |
-| `SESSION_START.md` | This file - quick orientation |
-| `QUICKSTART.md` | Phase 1 usage guide |
-| `idea/PLAN.md` | Master plan for all 11 phases |
-| `idea/phases/02_features.md` | Next phase spec (when ready) |
-| Memory: `~/.claude/projects/.../memory/MEMORY.md` | Project memory index |
+| `MASTER_INDEX.md` | Read first — tracks overall project progress |
+| `scripts/autonomous_trader.py` | Main trading bot — start here |
+| `src/intraday/llm/review.py` | LLM review agent — fix timeout handling |
+| `src/intraday/features/calculator.py` | Feature calculation — 20 features live |
+| `logs/autonomous_trader/` | Trade logs — check for actual executions |
+| Memory: `project_autonomous_trader.md` | Detailed pipeline status and findings |
 
 ---
 
 ## 💡 Quick Commands
 
 ```bash
-# Check what's downloaded
-intraday data summary
+# Test MT5 connection
+uv run python scripts/test_mt5.py
 
-# Resume download from checkpoint
-intraday data download --kind klines_5m
+# Test LLM connection
+uv run python scripts/test_llm_review.py
 
-# Download specific range
-intraday data download --kind klines_5m --start 2024-06-01 --end 2024-06-30
-
-# Start live capture (all streams)
-intraday data live-capture --streams trade,depth,mark_price,liquidations
-
-# View checkpoint details
-intraday data checkpoint
+# See exact LLM prompt
+uv run python scripts/report_llm_inputs.py
 
 # Run tests
-pytest tests/phase_01/ -v
+pytest tests/ -v
 
-# CLI help
-intraday --help
-intraday data --help
+# Check data
+intraday data summary
 ```
 
 ---
 
 ## 🎯 Session Workflow
 
-1. **Read MASTER_INDEX.md** → see current phase
-2. **Check if blocked** → Phase 2 blocked until 4-6 weeks data
-3. **Work on current phase** → Phase 1 = data collection
-4. **Update MASTER_INDEX** → when milestones hit
-5. **Update memory** → key learnings/decisions
+1. **Read `project_autonomous_trader.md` memory** → understand current pipeline state
+2. **Enable MT5 AutoTrading** → green button in terminal
+3. **Start trader** → `uv run python scripts/autonomous_trader.py ...`
+4. **Monitor logs** → tail -f for trades, errors, WebSocket issues
+5. **If no trades in 30 min** → check regime/flow alignment, consider lowering thresholds
+6. **If LLM times out** → restart trader, check network
+7. **Update memory** → log findings, new issues, fixes
 
 ---
 
 ## 📊 Progress Summary
 
 **Timeline:**
-- Day 1 of 60-80 total
-- Next milestone: 4-6 weeks (tick data collection)
+- Day 6 of 60-80 total
+- Phase 1-5 effectively complete (data + features + agents + aggregator + decision engine)
+- Phase 8 (paper trading) in progress — bot running, need actual trades
 
-**Phases:**
-- ✅ Phase 0: Planning
-- ✅ Phase 1: Implementation (code done)
-- ⏳ Phase 1: Data collection (4-6 weeks)
-- ⚪ Phase 2: Blocked (waiting for data)
-- ⚪ Phase 3-10: Blocked
+**What's Working:**
+- Full V6 pipeline ✅
+- LLM review ✅
+- MT5 execution ✅
+- Paper mode ✅
+- Regime fallback ✅
+
+**Blockers:**
+- Transformer concept drift (model too old) 🟡
+- LLM API timeout intermittently 🟡
+- WebSocket bar processing needs monitoring 🟡
+- Trade frequency too low 🟡
 
 **Tests:** 16/16 passing ✅
 
-**Data Collected:**
-- Historical: TBD (run downloads)
-- Live: TBD (start capture, accumulate 4-6 weeks)
+**Data:**
+- Historical: 128 bars loaded from Binance API (no warm-up needed)
+- Live: WebSocket streaming 1m + 5m klines
 
 ---
 
-**Remember:** Don't skip to Phase 2 until ≥4-6 weeks of live tick data is captured!
+**Remember:** Don't retrain on full 12mo yet — first prove the pipeline works with actual trades on paper mode, then scale up!

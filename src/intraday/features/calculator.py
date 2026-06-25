@@ -126,9 +126,11 @@ class FeatureCalculator:
         hawkes_beta: float = 10.0,
         hawkes_mu: float = 6.0,
         direction_threshold: float = 0.0005,
+        live_mode: bool = False,
     ) -> None:
         self.symbol = symbol
         self._thresh = direction_threshold
+        self._live_mode = live_mode
 
         # Price history
         self._klines_1m: deque[KlineBar] = deque(maxlen=60)
@@ -215,6 +217,10 @@ class FeatureCalculator:
         self._pending.append(row)
         self._attach_targets()
 
+        # Live mode: return the latest row immediately (no forward-target wait)
+        if self._live_mode:
+            return row
+
         # Once the oldest row has its 60m forward return (needs 12 future bars),
         # pop and return it — each row is returned exactly once.
         if len(self._pending) >= 13:
@@ -287,6 +293,9 @@ class FeatureCalculator:
         return FeatureRow(
             bar_time_ms=bar.open_time_ms,
             symbol=self.symbol,
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
             close=close,
             log_ret_1m=log_ret_1m,
             log_ret_5m=log_ret_5m,

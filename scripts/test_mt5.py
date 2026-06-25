@@ -55,7 +55,7 @@ def main(
 
     # Symbol mapping
     mt5_sym = mt5.to_mt5_symbol(symbol)
-    rprint(f"\n[yellow]Symbol mapping: {symbol} → {mt5_sym}[/yellow]")
+    rprint(f"\n[yellow]Symbol mapping: {symbol} -> {mt5_sym}[/yellow]")
 
     mt5.shutdown()
     rprint("\n[green]Done.[/green]")

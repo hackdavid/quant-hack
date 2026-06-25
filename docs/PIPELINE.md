@@ -668,7 +668,7 @@ TradeLogger (JSONL logs with full pipeline context)
 # On Windows — verify MT5 connection before running the full loop
 pip install MetaTrader5 polars numpy httpx websockets typer structlog rich
 python scripts/test_mt5.py \
-    --account 10408 --password "Daudibrahim@123" --server "3.11.134.149:443" \
+    --account YOUR_ACCOUNT --password "YOUR_PASSWORD" --server "YOUR_SERVER" \
     --symbol BTCUSDT
 ```
 
@@ -682,7 +682,7 @@ set LLM_MODEL=accounts/fireworks/routers/kimi-k2p6-turbo
 
 python scripts/autonomous_trader.py \
     --transformer-run models/transformer/20260623T132957Z \
-    --mt5-account 10408 --mt5-password "Daudibrahim@123" --mt5-server "3.11.134.149:443" \
+    --mt5-account YOUR_ACCOUNT --mt5-password "YOUR_PASSWORD" --mt5-server "YOUR_SERVER" \
     --use-llm --interval 5
 ```
 
@@ -696,7 +696,7 @@ export LLM_MODEL="accounts/fireworks/routers/kimi-k2p6-turbo"
 
 uv run python scripts/autonomous_trader.py \
     --transformer-run models/transformer/20260623T132957Z \
-    --mt5-account 10408 --mt5-password "..." --mt5-server "..." \
+    --mt5-account YOUR_ACCOUNT --mt5-password "..." --mt5-server "..." \
     --mock-execution --use-llm --interval 5
 ```
 
@@ -799,7 +799,7 @@ uv run python scripts/run_paper_trade.py \
 # Autonomous trader (mock mode)
 uv run python scripts/autonomous_trader.py \
     --transformer-run models/transformer/20260623T132957Z \
-    --mt5-account 10408 --mt5-password "..." --mt5-server "..." \
+    --mt5-account YOUR_ACCOUNT --mt5-password "..." --mt5-server "..." \
     --mock-execution --use-llm --interval 5
 
 # LLM review test

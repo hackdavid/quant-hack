@@ -62,6 +62,7 @@ class LLMReviewAgent:
         api_key: Bearer token
         model: Model name (e.g., accounts/fireworks/routers/kimi-k2p6-turbo)
         timeout: Request timeout in seconds
+        debug: If True, logs the full prompt to the structlog logger
     """
 
     def __init__(
@@ -69,14 +70,20 @@ class LLMReviewAgent:
         base_url: str | None = None,
         api_key: str | None = None,
         model: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 120.0,
+        debug: bool = False,
     ) -> None:
         self.base_url = (base_url or os.getenv("LLM_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
         if not self.base_url.endswith("/v1"):
             self.base_url = self.base_url + "/v1"
-        self.api_key = api_key or os.getenv("LLM_TOKEN", "")
+        # Only fall back to env if api_key is None (not provided), not if explicitly empty string
+        if api_key is None:
+            self.api_key = os.getenv("LLM_TOKEN", "")
+        else:
+            self.api_key = api_key
         self.model = model or os.getenv("LLM_MODEL", DEFAULT_MODEL)
         self.timeout = timeout
+        self.debug = debug
         self._client = httpx.Client(
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -89,7 +96,8 @@ class LLMReviewAgent:
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": 1024,
+            "max_tokens": 8192,
+            "response_format": {"type": "json_object"},
         }
         try:
             resp = self._client.post("/chat/completions", json=payload)
@@ -113,24 +121,77 @@ class LLMReviewAgent:
         risk_state: dict,
         recent_logs: list[dict],
         competition_rules: dict,
-    ) -> str:
-        """Build the system + user prompt for the LLM."""
-        recent = "\n".join(
-            f"- {e.get('ts', '?')}: {e.get('action', '?')} conf={e.get('confidence', 0)} reason={e.get('reason', '?')[:60]}"
-            for e in recent_logs[-10:]
+        pipeline: dict | None,
+    ) -> tuple[str, str]:
+        """Build the system + user prompt for the LLM.
+
+        Returns (system_prompt, user_prompt).
+        """
+        # ── Recent trades ──────────────────────────────────────────────────────
+        recent_lines: list[str] = []
+        for e in recent_logs[-20:]:
+            line = (
+                f"- {e.get('ts', '?'):19} | {e.get('action', '?'):>4} | "
+                f"conf={e.get('confidence', 0):.2f} | "
+                f"pos={e.get('position_size', 0):.2f} | "
+                f"bal={e.get('account_balance', 0):,.2f} | "
+                f"pnl={e.get('daily_pnl_pct', 0):+.2f}% | "
+                f"reason={e.get('reason', '?')[:80]}"
+            )
+            recent_lines.append(line)
+        recent = "\n".join(recent_lines) if recent_lines else "(none)"
+
+        # ── Pipeline context ───────────────────────────────────────────────────
+        pipe_text = ""
+        if pipeline:
+            fc = pipeline.get("forecast", {})
+            of = pipeline.get("orderflow", {})
+            rg = pipeline.get("regime", {})
+            rk = pipeline.get("risk", {})
+            so = pipeline.get("stay_out", {})
+            de = pipeline.get("decision", {})
+            pipe_text = f"""
+PIPELINE ANALYSIS:
+- Forecast: p_up={fc.get('p_up', 0.5):.4f} | confidence={fc.get('confidence', 0):.4f} | expected_move={fc.get('expected_move', 0):.4f}
+- Orderflow: flow_bias={of.get('flow_bias', 0):.2f} | vpin={of.get('vpin', 0):.4f}
+- Regime: {rg.get('regime', 'unknown')} | vol_regime={rg.get('vol_regime', 'normal')}
+- Risk: allow_trade={rk.get('allow_trade', True)} | multiplier={rk.get('risk_multiplier', 1.0):.2f}
+- StayOut: mode={so.get('mode', 'normal')}
+- Decision: side={de.get('side', 'flat')} | confidence={de.get('confidence', 0):.4f} | reason={de.get('reason', 'N/A')}
+"""
+
+        # ── Positions ──────────────────────────────────────────────────────────
+        pos_lines: list[str] = []
+        for p in positions:
+            pos_lines.append(
+                f"  {p.get('side', '?'):>5} {p.get('volume', 0):.4f} lot @ "
+                f"{p.get('open_price', 0):.2f} | PnL={p.get('profit', 0):+.2f} | "
+                f"SL={p.get('sl', 0):.2f} TP={p.get('tp', 0):.2f}"
+            )
+        pos_text = "\n".join(pos_lines) if pos_lines else "  (no open positions)"
+
+        # ── Candle ─────────────────────────────────────────────────────────────
+        candle_text = (
+            f"Open: {bar.get('open', 0):.2f} | High: {bar.get('high', 0):.2f} | "
+            f"Low: {bar.get('low', 0):.2f} | Close: {bar.get('close', 0):.2f} | "
+            f"Volume: {bar.get('volume', 0):.2f} | Trades: {bar.get('trade_count', 0)} | "
+            f"TakerBuy: {bar.get('taker_buy_ratio', 0):.2%}"
         )
 
         system = """You are a quantitative risk committee for a live trading competition.
 
-CRITICAL: You must output ONLY a raw JSON object. No markdown, no explanation, no code blocks, no thinking tags.
-The JSON must match this exact schema and contain REAL values (not placeholders):
-{"action": "BUY", "confidence": 0.72, "reason": "Uptrend confirmed with acceptable risk metrics", "position_size": 0.50, "sl_price": 92000.0, "tp_price": 98000.0, "risk_approved": true}
+CRITICAL INSTRUCTIONS:
+1. You MUST output ONLY a raw JSON object. No markdown, no explanation, no code blocks, no thinking tags, no preamble.
+2. The JSON must match this EXACT schema with REAL values (not placeholders):
+   {"action": "BUY", "confidence": 0.72, "reason": "Uptrend confirmed with acceptable risk metrics", "position_size": 0.50, "sl_price": 92000.0, "tp_price": 98000.0, "risk_approved": true}
+3. Do NOT add any text before or after the JSON. Do NOT wrap it in ```json fences.
+4. The response must be parseable by json.loads() directly.
 
 Position sizing rules:
-- confidence < 0.60 → action=HOLD, position_size=0.0
-- 0.60-0.75 → position_size=0.25
-- 0.75-0.85 → position_size=0.50
-- > 0.85 → position_size=1.00
+- confidence < 0.60 -> action=HOLD, position_size=0.0
+- 0.60-0.75 -> position_size=0.25
+- 0.75-0.85 -> position_size=0.50
+- > 0.85 -> position_size=1.00
 
 If risk rules are violated, set risk_approved=false and action=HOLD.
 """
@@ -141,20 +202,31 @@ COMPETITION RULES:
 
 CURRENT STATE:
 - Signal: {signal} | Confidence: {confidence}
-- Bar close: {bar.get('close', '?')} | Volume: {bar.get('volume', '?')}
-- Account balance: {account.get('balance', 0)} | Equity: {account.get('equity', 0)}
+- Candle: {candle_text}
+- Account balance: {account.get('balance', 0):,.2f} | Equity: {account.get('equity', 0):,.2f} | Profit: {account.get('profit', 0):+.2f}
 - Open positions: {len(positions)}
+{pos_text}
 - Daily trades so far: {risk_state.get('trade_count_today', 0)}
 - Current drawdown: {risk_state.get('drawdown_pct', 0):.2f}%
-- Daily PnL: {risk_state.get('daily_pnl_pct', 0):.2f}%
+- Daily PnL: {risk_state.get('daily_pnl_pct', 0):+.2f}%
+- Weekly PnL: {risk_state.get('weekly_pnl_pct', 0):+.2f}%
 - Total exposure: {risk_state.get('total_exposure_pct', 0):.2f}%
+{pipe_text}
 
-RECENT TRADES:
+RECENT TRADES (last 20):
 {recent}
 
 YOUR TASK:
 Review the signal and return ONLY the JSON object.
 """
+        if self.debug:
+            log.info(
+                "llm_prompt_debug",
+                system_chars=len(system),
+                user_chars=len(user),
+                total_chars=len(system) + len(user),
+                prompt=user,
+            )
         return system, user
 
     def review(
@@ -167,6 +239,7 @@ Review the signal and return ONLY the JSON object.
         risk_state: dict,
         recent_logs: list[dict],
         competition_rules: dict | None = None,
+        pipeline: dict | None = None,
     ) -> LLMReview:
         """Get LLM review of the trading signal.
 
@@ -179,7 +252,7 @@ Review the signal and return ONLY the JSON object.
 
         rules = competition_rules or _default_competition_rules()
         system, user = self._build_prompt(
-            signal, confidence, bar, positions, account, risk_state, recent_logs, rules
+            signal, confidence, bar, positions, account, risk_state, recent_logs, rules, pipeline
         )
 
         try:
@@ -218,12 +291,14 @@ Review the signal and return ONLY the JSON object.
                 except Exception:
                     pass
 
-        # Strategy 3: Try to find the first JSON object via regex
-        json_match = re.search(r'\{[^{}]*"action"[^{}]*\}', text, re.DOTALL)
-        if json_match:
+        # Strategy 3: Extract the last JSON object from the text using brace matching.
+        # Models often emit reasoning text first, then the JSON at the end.
+        last_json = self._extract_last_json(text)
+        if last_json:
             try:
-                data = json.loads(json_match.group(0))
-                return self._build_review(data)
+                data = json.loads(last_json)
+                if "action" in data:
+                    return self._build_review(data)
             except Exception:
                 pass
 
@@ -234,6 +309,36 @@ Review the signal and return ONLY the JSON object.
         except Exception as exc:
             log.warning("llm_json_parse_failed", text=text[:200], error=str(exc))
             return self._rule_based("HOLD", 0.0, {}, {})
+
+    def _extract_last_json(self, text: str) -> str | None:
+        """Find the last top-level JSON object in text by brace matching."""
+        # Collect all brace positions by scanning the string directly
+        opens: list[int] = []
+        closes: list[int] = []
+        for i, ch in enumerate(text):
+            if ch == '{':
+                opens.append(i)
+            elif ch == '}':
+                closes.append(i)
+
+        if not opens or not closes:
+            return None
+
+        # Work backwards from the last close brace to find a balanced open
+        for close_idx in reversed(closes):
+            depth = 0
+            for i in range(close_idx, -1, -1):
+                if text[i] == '}':
+                    depth += 1
+                elif text[i] == '{':
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[i:close_idx + 1]
+                        # Sanity check: must contain "action" key
+                        if '"action"' in candidate:
+                            return candidate
+                        break
+        return None
 
     def _build_review(self, data: dict) -> LLMReview:
         """Build LLMReview from parsed dict."""
@@ -297,6 +402,183 @@ Review the signal and return ONLY the JSON object.
             tp_price=round(tp, 2),
             risk_approved=True,
         )
+
+    def analyze_chart(
+        self,
+        candles: list[dict],
+        indicators: dict,
+        positions: list[dict],
+        account: dict,
+        risk_state: dict,
+        recent_logs: list[dict],
+        competition_rules: dict | None = None,
+        last_trade_reason: str | None = None,
+    ) -> LLMReview:
+        """Use LLM as primary decision maker.
+
+        Instead of validating a signal, the LLM analyzes the chart
+        and returns a trade decision directly.
+        """
+        if not self.api_key:
+            log.warning("no_api_key")
+            return self._rule_based("HOLD", 0.0, {}, risk_state)
+
+        rules = competition_rules or _default_competition_rules()
+        system, user = self._build_chart_prompt(
+            candles, indicators, positions, account, risk_state, recent_logs, rules, last_trade_reason
+        )
+
+        try:
+            text = self._call_llm(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]
+            )
+            return self._parse_response(text)
+        except Exception as exc:
+            log.error("llm_analyze_failed", error=str(exc))
+            return self._rule_based("HOLD", 0.0, {}, risk_state)
+
+    def _build_chart_prompt(
+        self,
+        candles: list[dict],
+        indicators: dict,
+        positions: list[dict],
+        account: dict,
+        risk_state: dict,
+        recent_logs: list[dict],
+        competition_rules: dict,
+        last_trade_reason: str | None = None,
+    ) -> tuple[str, str]:
+        """Build a chart analysis prompt for the LLM.
+
+        Describes the last 40 candles as a human trader would see them.
+        """
+        # Build candle table
+        candle_lines = []
+        for i, c in enumerate(candles[-40:]):
+            candle_lines.append(
+                f"  {i+1:2d}. | O:{c['open']:8.2f} | H:{c['high']:8.2f} | L:{c['low']:8.2f} | C:{c['close']:8.2f} | V:{c['volume']:8.2f} | T:{c['trades']:5d} | Taker:{c['taker_buy_pct']:5.1f}%"
+            )
+        candle_table = "\n".join(candle_lines)
+
+        # Current price and recent stats
+        current = candles[-1] if candles else {"close": 0.0, "high": 0.0, "low": 0.0}
+        close = current["close"]
+        recent_high = max(c["high"] for c in candles[-40:]) if candles else close
+        recent_low = min(c["low"] for c in candles[-40:]) if candles else close
+        price_range = recent_high - recent_low
+
+        # Indicator summary
+        ind_text = ""
+        if indicators:
+            ind_lines = []
+            for k, v in indicators.items():
+                if v is not None:
+                    ind_lines.append(f"- {k}: {v}")
+            ind_text = "\n".join(ind_lines) if ind_lines else "  (no indicators available)"
+        else:
+            ind_text = "  (no indicators available)"
+
+        # Positions
+        pos_lines: list[str] = []
+        for p in positions:
+            pos_lines.append(
+                f"  {p.get('side', '?'):>5} {p.get('volume', 0):.4f} lot @ "
+                f"{p.get('open_price', 0):.2f} | PnL={p.get('profit', 0):+.2f} | "
+                f"SL={p.get('sl', 0):.2f} TP={p.get('tp', 0):.2f}"
+            )
+        pos_text = "\n".join(pos_lines) if pos_lines else "  (no open positions)"
+
+        # Recent trades
+        recent_lines: list[str] = []
+        for e in recent_logs[-10:]:
+            line = (
+                f"- {e.get('ts', '?'):19} | {e.get('action', '?'):>4} | "
+                f"conf={e.get('confidence', 0):.2f} | "
+                f"pos={e.get('position_size', 0):.2f} | "
+                f"bal={e.get('account_balance', 0):,.2f} | "
+                f"pnl={e.get('daily_pnl_pct', 0):+.2f}%"
+            )
+            recent_lines.append(line)
+        recent = "\n".join(recent_lines) if recent_lines else "  (no recent trades)"
+
+        system = """You are a professional BTC/USD intraday trader. You analyze charts and make trade decisions.
+
+CRITICAL INSTRUCTIONS:
+1. You MUST output ONLY a raw JSON object. No markdown, no explanation, no code blocks.
+2. The JSON must match this EXACT schema:
+   {"action": "BUY", "confidence": 0.72, "reason": "Bullish breakout with volume confirmation", "position_size": 0.25, "sl_price": 62000.0, "tp_price": 64000.0, "risk_approved": true}
+3. Do NOT add any text before or after the JSON.
+4. Available actions: "BUY", "SELL", "HOLD"
+
+Trading Rules:
+- Look for ANY edge: momentum, mean reversion, volume spikes, support/resistance tests
+- Set stop loss at recent swing low/high or using ATR
+- Set take profit at 2:1 risk/reward minimum
+- Position size: 0.25 for moderate setups, 0.50 for strong setups, 1.00 for exceptional setups
+- IMPORTANT: If you see even a slight directional bias or momentum, take a small position (0.25) rather than HOLD
+- The competition requires 5-10 trades per day — don't be too conservative
+- If already in a position, consider closing or adding based on the setup
+"""
+
+        last_trade_text = f"\nLAST TRADE CLOSE: {last_trade_reason}" if last_trade_reason else ""
+
+        user = f"""
+COMPETITION RULES:
+{json.dumps(competition_rules, indent=2)}
+
+CHART ANALYSIS — BTCUSDT Recent 40 Candles:
+
+{candle_table}
+
+KEY LEVELS:
+- Recent High: {recent_high:.2f}
+- Recent Low: {recent_low:.2f}
+- Price Range: {price_range:.2f}
+- Current Price: {close:.2f}
+
+TECHNICAL INDICATORS:
+{ind_text}
+
+ACCOUNT STATUS:
+- Balance: {account.get('balance', 0):,.2f}
+- Equity: {account.get('equity', 0):,.2f}
+- Profit: {account.get('profit', 0):+.2f}
+- Open Positions: {len(positions)}
+{pos_text}
+- Daily trades: {risk_state.get('trade_count_today', 0)}
+- Drawdown: {risk_state.get('drawdown_pct', 0):.2f}%
+- Daily PnL: {risk_state.get('daily_pnl_pct', 0):+.2f}%
+
+RECENT TRADES:
+{recent}
+{last_trade_text}
+
+YOUR TASK:
+Analyze the chart above. Identify the trend, support/resistance, volume patterns, and any clear trade setups.
+
+Return ONLY a JSON object with your decision:
+- action: "BUY" | "SELL" | "HOLD"
+- confidence: 0.0-1.0 (how confident you are in this setup)
+- reason: brief explanation of the setup
+- position_size: 0.0-1.0 (fraction of capital to risk)
+- sl_price: stop loss price
+- tp_price: take profit price
+- risk_approved: true if this trade follows the risk rules
+
+If no clear setup exists, return HOLD with confidence 0.0.
+"""
+        if self.debug:
+            log.info(
+                "llm_chart_prompt_debug",
+                system_chars=len(system),
+                user_chars=len(user),
+                total_chars=len(system) + len(user),
+                prompt=user,
+            )
+        return system, user
 
 
 def _default_competition_rules() -> dict:

@@ -22,6 +22,9 @@ class FeatureRow(BaseModel):
     symbol: str = "BTCUSDT"
 
     # ── Price ─────────────────────────────────────────────────────────────
+    open: float
+    high: float
+    low: float
     close: float
     log_ret_1m: float   = Field(description="Log return of the last 1m bar")
     log_ret_5m: float   = Field(description="Log return of this 5m bar")
@@ -68,6 +71,9 @@ class FeatureRow(BaseModel):
 FEATURE_ROW_SCHEMA: dict[str, pl.DataType] = {
     "bar_time_ms":             pl.Int64,
     "symbol":                  pl.Utf8,
+    "open":                    pl.Float64,
+    "high":                    pl.Float64,
+    "low":                     pl.Float64,
     "close":                   pl.Float64,
     "log_ret_1m":              pl.Float64,
     "log_ret_5m":              pl.Float64,
